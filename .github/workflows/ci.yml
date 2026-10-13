@@ -1,0 +1,47 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        php: ["7.4", "8.3"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: ${{ matrix.php }}
+          tools: composer:v2
+          coverage: none
+      - run: composer install --no-interaction --no-progress
+      - run: composer test
+      - run: composer lint
+      - name: Sintaxis de cada archivo
+        run: find . -name '*.php' -not -path './vendor/*' -print0 | xargs -0 -n1 php -l
+
+  release:
+    needs: test
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Versión del tag = versión del plugin
+        run: |
+          v="${GITHUB_REF_NAME#v}"
+          grep -q "Version:              $v" urbby-woocommerce.php
+          grep -q "Stable tag: $v" readme.txt
+      - run: git archive --format=zip --prefix=urbby-woocommerce/ -o urbby-woocommerce.zip HEAD
+      - run: gh release create "$GITHUB_REF_NAME" urbby-woocommerce.zip --generate-notes
+        env:
+          GH_TOKEN: ${{ github.token }}

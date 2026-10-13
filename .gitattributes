@@ -1,0 +1,9 @@
+# Lo que no viaja en el .zip del plugin (git archive).
+/tests export-ignore
+/.github export-ignore
+/composer.json export-ignore
+/phpunit.xml.dist export-ignore
+/phpcs.xml.dist export-ignore
+/.gitignore export-ignore
+/.gitattributes export-ignore
+/README.md export-ignore

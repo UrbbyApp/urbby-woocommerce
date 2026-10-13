@@ -1,0 +1,23 @@
+<?xml version="1.0"?>
+<ruleset name="urbby-woocommerce">
+  <description>WordPress Coding Standards + compatibilidad con PHP 7.4.</description>
+  <file>urbby-woocommerce.php</file>
+  <file>includes</file>
+  <arg name="extensions" value="php"/>
+  <arg value="sp"/>
+  <config name="testVersion" value="7.4-"/>
+  <config name="minimum_wp_version" value="6.4"/>
+  <rule ref="PHPCompatibilityWP"/>
+  <rule ref="WordPress-Extra">
+    <!-- Nombres de archivo y comentarios: se sigue el estilo del repo (class-*.php, comentarios en español). -->
+    <exclude name="Squiz.Commenting.FunctionComment.Missing"/>
+    <exclude name="Squiz.Commenting.VariableComment.Missing"/>
+    <exclude name="Squiz.Commenting.FunctionComment.MissingParamComment"/>
+    <exclude name="Generic.Commenting.DocComment.MissingShort"/>
+  </rule>
+  <rule ref="WordPress.WP.I18n">
+    <properties>
+      <property name="text_domain" type="array" value="urbby-woocommerce"/>
+    </properties>
+  </rule>
+</ruleset>
