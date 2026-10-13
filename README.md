@@ -34,13 +34,21 @@ La orden de Woo de un pedido de Urbby es un registro:
 ## Instalación
 
 1. Descargá el `.zip` del último [release](https://github.com/UrbbyApp/urbby-woocommerce/releases) y subilo en **Plugins → Añadir nuevo → Subir plugin**.
-2. Abrí **WooCommerce → Urbby** y pegá el Client ID y el Client secret.
+2. Abrí **WooCommerce → Urbby**, pegá el Client ID y el Client secret, guardá y tocá **Probar conexión**. La prueba revisa cada permiso que el plugin necesita, sin escribir nada.
 3. En el portal de Urbby creá un webhook:
    - URL: la que muestra la pantalla (`https://tu-tienda/wp-json/urbby/v1/webhook`).
    - Eventos: `order_created`, `order_status_changed` y `shipment_status_changed`.
    - Después pegá su secreto en el plugin.
 4. Elegí la categoría de Urbby de cada categoría de tu tienda (o una por defecto) y guardá.
 5. Tocá **Enviar catálogo a Urbby**. Lo que no se pueda enviar aparece con su motivo en la columna «Urbby» de la lista de productos.
+
+## Lo que la v1 no hace (a propósito)
+
+- **Reembolsos parciales:** un reembolso total devuelve el stock en Urbby; uno parcial no. Ajustá el stock a mano si la mercadería volvió.
+- **Cambiar cantidades de una línea de Urbby en el admin de Woo** no mueve el stock de Urbby. El pedido se maneja desde Urbby.
+- **Copias del sitio:** si la dirección del sitio cambia (un staging clonado, un backup restaurado en otro dominio), el plugin deja de hablar con Urbby hasta que se vuelva a guardar la conexión. Así una copia no vende ni mueve el stock real.
+- **Otro API:** para pruebas, el API se cambia con `define( 'URBBY_WC_API_BASE', 'https://…/v1' );` en `wp-config.php`. No se puede cambiar desde la pantalla.
+- **Desinstalar** borra la credencial, pero conserva el vínculo de cada producto. Al reinstalar no se vuelve a migrar el stock, que pisaría el de Urbby.
 
 ## Desarrollo
 

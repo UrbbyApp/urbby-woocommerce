@@ -92,13 +92,12 @@ final class Urbby_WC_Orders {
 	 * @return string created | updated | unchanged | busy
 	 */
 	public static function upsert( array $f, $sandbox = false ) {
-		$lock = 'urbby_wc_lock_' . md5( $f['id'] );
-		// add_option es atómico (option_name es único): sirve de candado entre dos avisos simultáneos.
-		if ( ! add_option( $lock, time(), '', 'no' ) ) {
-			if ( (int) get_option( $lock ) > time() - 60 ) {
-				return 'busy';
-			}
-			update_option( $lock, time(), false ); // Candado de un proceso que murió.
+		// Candado de MySQL por pedido: dos avisos del mismo pedido a la vez (un reintento de Urbby y la
+		// reconciliación) no crean dos órdenes. `add_option` no sirve: es un INSERT … ON DUPLICATE KEY.
+		global $wpdb;
+		$lock = 'urbby_wc_' . md5( $f['id'] );
+		if ( '1' !== (string) $wpdb->get_var( $wpdb->prepare( 'SELECT GET_LOCK(%s, 5)', $lock ) ) ) {
+			return 'busy';
 		}
 		try {
 			$order = self::find( $f['id'] );
@@ -115,7 +114,7 @@ final class Urbby_WC_Orders {
 			$order->save();
 			return 'updated';
 		} finally {
-			delete_option( $lock );
+			$wpdb->query( $wpdb->prepare( 'SELECT RELEASE_LOCK(%s)', $lock ) );
 		}
 	}
 
@@ -129,7 +128,8 @@ final class Urbby_WC_Orders {
 				'limit'      => 1,
 				'meta_key'   => self::META_FULFILLMENT, // phpcs:ignore WordPress.DB.SlowDBQuery
 				'meta_value' => $fulfillment_id, // phpcs:ignore WordPress.DB.SlowDBQuery
-				'status'     => 'any',
+				// Con la papelera: una orden de Urbby que el comercio tiró no se vuelve a crear con el próximo aviso.
+				'status'     => array_merge( array_keys( wc_get_order_statuses() ), array( 'trash' ) ),
 			)
 		);
 		return $orders ? $orders[0] : null;
@@ -140,7 +140,10 @@ final class Urbby_WC_Orders {
 	 * @param bool  $sandbox Compra de prueba.
 	 */
 	private static function create( array $f, $sandbox ) {
-		$order = wc_create_order( array( 'created_via' => 'urbby' ) );
+		// Se arma entera y se guarda UNA vez: `wc_create_order` la persistía vacía, y una falla en el
+		// medio dejaba una orden huérfana por cada reintento.
+		$order = new WC_Order();
+		$order->set_created_via( 'urbby' );
 		$order->update_meta_data( self::META_FULFILLMENT, $f['id'] );
 		$order->update_meta_data( self::META_NUMBER, $f['orderNumber'] );
 		$order->update_meta_data( self::META_VERSION, Urbby_WC_Mapper::version( $f ) );
@@ -160,7 +163,8 @@ final class Urbby_WC_Orders {
 		$order->set_address( array_merge( $fields, array( 'phone' => isset( $address['phone'] ) ? $address['phone'] : '' ) ), 'billing' );
 		$order->set_address( $fields, 'shipping' );
 
-		$map = Urbby_WC_Stock::variant_map();
+		$map   = Urbby_WC_Stock::variant_map();
+		$notes = array();
 		foreach ( (array) $f['items'] as $line ) {
 			$item = new WC_Order_Item_Product();
 			$woo  = ! empty( $line['variantId'] ) && isset( $map[ $line['variantId'] ] ) ? wc_get_product( $map[ $line['variantId'] ] ) : null;
@@ -177,22 +181,27 @@ final class Urbby_WC_Orders {
 			}
 			$order->add_item( $item );
 			if ( ! $woo ) {
-				$order->add_order_note( 'Urbby: «' . $line['title'] . '» no está vinculado a un producto de esta tienda.' );
+				$notes[] = 'Urbby: «' . $line['title'] . '» no está vinculado a un producto de esta tienda.';
 			}
 		}
 
 		$order->set_payment_method( 'urbby' );
 		$order->set_payment_method_title( 'Urbby' . ( 'cod' === ( isset( $f['paymentMethod'] ) ? $f['paymentMethod'] : '' ) ? ' (contra entrega)' : '' ) );
 		$order->calculate_totals( false );
-		$order->add_order_note(
+		array_unshift(
+			$notes,
 			( $sandbox ? 'PRUEBA del Sandbox de Urbby. ' : '' ) . 'Pedido #' . $f['orderNumber'] . ' de Urbby. El cobro y el envío los maneja Urbby; el estado se actualiza solo.'
 			. ( ! empty( $f['couponCode'] ) ? ' El comprador usó el cupón ' . $f['couponCode'] . ' en Urbby: no cambia esta orden.' : '' )
 		);
 		self::apply_status( $order, $f );
 		$order->save();
+		foreach ( $notes as $note ) {
+			$order->add_order_note( $note );
+		}
 
 		// La copia local se pone al día con el número de Urbby, no restando acá: si la sincronización
 		// ya vio esta venta (un aviso que llegó tarde, la reconciliación), restar la contaría dos veces.
+		// En segundo plano: el aviso tiene que contestar rápido.
 		if ( ! $sandbox ) {
 			$products = array();
 			foreach ( $order->get_items() as $item ) {
@@ -201,7 +210,9 @@ final class Urbby_WC_Orders {
 					$products[ $urbby_product ] = true;
 				}
 			}
-			Urbby_WC_Stock::refresh_products( array_keys( $products ) );
+			if ( $products ) {
+				as_enqueue_async_action( Urbby_WC_Stock::ACTION_REFRESH, array( array_keys( $products ) ), 'urbby' );
+			}
 		}
 	}
 

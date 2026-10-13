@@ -21,6 +21,9 @@ final class Urbby_WC_Api {
 	 * @return Urbby_WC_Response
 	 */
 	public static function request( $method, $path, $body = null, $timeout = 15 ) {
+		if ( Urbby_WC_Settings::moved() ) {
+			return new Urbby_WC_Response( 0, null, 'este sitio no es el que se conectó; guardá la conexión de nuevo' );
+		}
 		$s    = Urbby_WC_Settings::get();
 		$args = array(
 			'method'      => $method,

@@ -6,8 +6,9 @@
  *   hecha (pago, «procesando»). Si Urbby no tiene stock, la venta no pasa.
  * - El stock que muestra Woo es una copia del de Urbby: se pone al día después de cada reserva y cada
  *   30 minutos.
- * - Un cambio a mano en Woo (el comercio recibió mercadería) viaja a Urbby como diferencia, nunca
- *   como número absoluto: un absoluto pisaría las ventas que entraron mientras tanto.
+ * - Un cambio a mano en Woo (el comercio recibió mercadería) viaja a Urbby como escritura condicional
+ *   contra lo último que copiamos de Urbby: si Urbby se movió en el medio, se reaplica la diferencia
+ *   del comercio sobre lo que hay, nunca se pisa una venta.
  *
  * @package UrbbyWooCommerce
  */
@@ -19,18 +20,27 @@ defined( 'ABSPATH' ) || exit;
  */
 final class Urbby_WC_Stock {
 
-	const META_SYNCED  = '_urbby_stock_synced';
-	const META_PENDING = '_urbby_stock_pending';
+	const META_SYNCED   = '_urbby_stock_synced';
+	const META_PENDING  = '_urbby_stock_pending';
+	const META_INFLIGHT = '_urbby_stock_inflight';
 
 	const ORDER_RESERVATION = '_urbby_reservation_id';
 	const ORDER_REFERENCE   = '_urbby_reservation_ref';
+	const ORDER_BASE_REF    = '_urbby_reservation_base';
 	const ORDER_STATE       = '_urbby_reservation_status';
+	const ORDER_RETRIES     = '_urbby_retries';
 
 	const ACTION_SYNC      = 'urbby_wc_sync_stock';
 	const ACTION_SYNC_PAGE = 'urbby_wc_sync_stock_page';
 	const ACTION_DELTA     = 'urbby_wc_push_delta';
 	const ACTION_SETTLE    = 'urbby_wc_settle_order';
 	const ACTION_RELEASE   = 'urbby_wc_release_order';
+	const ACTION_RELEASE_R = 'urbby_wc_release_reservation';
+	const ACTION_REFRESH   = 'urbby_wc_refresh_products';
+
+	/** Estados en los que una venta de la tienda está hecha / caída. */
+	const SOLD     = array( 'processing', 'completed', 'on-hold' );
+	const RELEASED = array( 'cancelled', 'failed', 'refunded' );
 
 	/**
 	 * Mientras es true, los cambios de stock son nuestros (copia de Urbby) y no se reenvían a Urbby
@@ -43,24 +53,78 @@ final class Urbby_WC_Stock {
 	/** @var bool Corta la recursión de settle → update_status → settle. */
 	private static $settling = false;
 
+	/** @var array<string,int>|null Mapa variante de Urbby → producto de Woo, por request. */
+	private static $map = null;
+
 	public static function hooks() {
 		add_filter( 'woocommerce_can_reduce_order_stock', array( __CLASS__, 'can_reduce' ), 20, 2 );
+		add_filter( 'woocommerce_prevent_adjust_line_item_product_stock', array( __CLASS__, 'prevent_adjust' ), 20, 2 );
 		add_action( 'woocommerce_product_set_stock', array( __CLASS__, 'on_stock_set' ) );
 		add_action( 'woocommerce_variation_set_stock', array( __CLASS__, 'on_stock_set' ) );
 		add_action( 'woocommerce_checkout_order_created', array( __CLASS__, 'reserve_classic' ) );
 		// Después de validar dirección y carrito, antes del pago: una compra que Woo igual iba a rechazar no aparta nada.
 		add_action( 'woocommerce_store_api_checkout_order_processed', array( __CLASS__, 'reserve_blocks' ) );
-		foreach ( array( 'processing', 'completed', 'on-hold' ) as $status ) {
+		foreach ( self::SOLD as $status ) {
 			add_action( 'woocommerce_order_status_' . $status, array( __CLASS__, 'settle' ) );
 		}
-		foreach ( array( 'cancelled', 'failed', 'refunded' ) as $status ) {
+		foreach ( self::RELEASED as $status ) {
 			add_action( 'woocommerce_order_status_' . $status, array( __CLASS__, 'release_for_order' ) );
 		}
+		add_action( 'woocommerce_trash_order', array( __CLASS__, 'release_on_remove' ) );
+		add_action( 'woocommerce_before_delete_order', array( __CLASS__, 'release_on_remove' ) );
 		add_action( self::ACTION_SYNC, array( __CLASS__, 'sync_from_urbby' ) );
 		add_action( self::ACTION_SYNC_PAGE, array( __CLASS__, 'sync_from_urbby' ) );
 		add_action( self::ACTION_DELTA, array( __CLASS__, 'push_delta' ) );
 		add_action( self::ACTION_SETTLE, array( __CLASS__, 'settle' ) );
 		add_action( self::ACTION_RELEASE, array( __CLASS__, 'release_for_order' ) );
+		add_action( self::ACTION_RELEASE_R, array( __CLASS__, 'release_reservation' ), 10, 2 );
+		add_action( self::ACTION_REFRESH, array( __CLASS__, 'refresh_products' ) );
+	}
+
+	// ─────────────────────────────────────────────────────────── tareas en segundo plano
+
+	/**
+	 * Hay una tarea PENDIENTE igual. `as_has_scheduled_action` cuenta también la que está corriendo,
+	 * y desde adentro de un reintento eso cortaba la cadena: se veía a sí misma y no reprogramaba.
+	 *
+	 * @param string $hook Tarea.
+	 * @param array  $args Argumentos.
+	 * @return bool
+	 */
+	public static function pending( $hook, array $args ) {
+		return (bool) as_get_scheduled_actions(
+			array(
+				'hook'     => $hook,
+				'args'     => $args,
+				'group'    => 'urbby',
+				'status'   => ActionScheduler_Store::STATUS_PENDING,
+				'per_page' => 1,
+			),
+			'ids'
+		);
+	}
+
+	/**
+	 * Encola una tarea si no hay otra igual pendiente.
+	 *
+	 * @param string $hook  Tarea.
+	 * @param array  $args  Argumentos.
+	 * @param int    $delay Segundos.
+	 */
+	public static function later( $hook, array $args, $delay ) {
+		if ( ! self::pending( $hook, $args ) ) {
+			as_schedule_single_action( time() + max( 1, (int) $delay ), $hook, $args, 'urbby' );
+		}
+	}
+
+	/**
+	 * Espera creciente: 1, 2, 4, 8 y después cada 15 minutos.
+	 *
+	 * @param int $attempt Intento (0 el primero).
+	 * @return int Segundos.
+	 */
+	private static function backoff( $attempt ) {
+		return min( 900, 60 * ( 2 ** min( 4, max( 0, (int) $attempt ) ) ) );
 	}
 
 	// ─────────────────────────────────────────────────────────── ventas de la tienda Woo
@@ -74,8 +138,7 @@ final class Urbby_WC_Stock {
 	public static function urbby_lines( WC_Order $order ) {
 		$lines = array();
 		foreach ( $order->get_items() as $item ) {
-			$product = $item instanceof WC_Order_Item_Product ? $item->get_product() : null;
-			$variant = $product ? get_post_meta( $product->get_id(), Urbby_WC_Catalog::META_VARIANT, true ) : '';
+			$variant = self::variant_of_item( $item );
 			if ( $variant ) {
 				$lines[] = array(
 					'variantId' => $variant,
@@ -84,6 +147,15 @@ final class Urbby_WC_Stock {
 			}
 		}
 		return Urbby_WC_Mapper::merge_lines( $lines );
+	}
+
+	/**
+	 * @param WC_Order_Item $item Línea.
+	 * @return string Variante de Urbby, o '' si la línea no está en Urbby.
+	 */
+	private static function variant_of_item( $item ) {
+		$product = $item instanceof WC_Order_Item_Product ? $item->get_product() : null;
+		return $product ? (string) get_post_meta( $product->get_id(), Urbby_WC_Catalog::META_VARIANT, true ) : '';
 	}
 
 	/**
@@ -98,17 +170,18 @@ final class Urbby_WC_Stock {
 		if ( ! $lines ) {
 			return true;
 		}
-		$reference = Urbby_WC_Mapper::reservation_reference( $order->get_id(), $lines );
-		$previous  = (string) $order->get_meta( self::ORDER_RESERVATION );
-		if ( $previous && $order->get_meta( self::ORDER_REFERENCE ) === $reference && 'held' === $order->get_meta( self::ORDER_STATE ) ) {
+		$base     = Urbby_WC_Mapper::reservation_reference( $order->get_id(), $lines, home_url() );
+		$previous = (string) $order->get_meta( self::ORDER_RESERVATION );
+		if ( $previous && $order->get_meta( self::ORDER_BASE_REF ) === $base && 'held' === $order->get_meta( self::ORDER_STATE ) ) {
 			return true;
 		}
-		if ( $previous ) {
+		if ( $previous && 'released' !== $order->get_meta( self::ORDER_STATE ) ) {
 			Urbby_WC_Api::release( $previous );
 		}
 
-		$hold = (int) Urbby_WC_Settings::get()['hold_minutes'];
-		$res  = Urbby_WC_Api::reserve( $reference, $lines, $hold );
+		$hold      = (int) Urbby_WC_Settings::get()['hold_minutes'];
+		$reference = $base;
+		$res       = Urbby_WC_Api::reserve( $reference, $lines, $hold );
 		if ( $res->ok() && 'released' === $res->body['status'] ) {
 			// Esa reference ya se usó y venció (el cliente volvió horas después): otra reference.
 			$reference .= '-' . time();
@@ -122,9 +195,10 @@ final class Urbby_WC_Stock {
 			}
 			return $res;
 		}
-		$order->update_meta_data( self::ORDER_RESERVATION, $res->body['id'] );
+		$order->update_meta_data( self::ORDER_RESERVATION, (string) $res->body['id'] );
 		$order->update_meta_data( self::ORDER_REFERENCE, $reference );
-		$order->update_meta_data( self::ORDER_STATE, $res->body['status'] );
+		$order->update_meta_data( self::ORDER_BASE_REF, $base );
+		$order->update_meta_data( self::ORDER_STATE, (string) $res->body['status'] );
 		$order->save();
 		self::display_from_reservation( $res->body );
 		return true;
@@ -199,15 +273,36 @@ final class Urbby_WC_Stock {
 	}
 
 	/**
+	 * Guardar una orden en el admin (o editarla por la API REST) ajusta el stock de cada línea que no
+	 * tenga `_reduced_stock`. Las de Urbby no lo tienen a propósito: sin esto, cada «Actualizar» de una
+	 * orden descontaba otra vez y el descuento viajaba a Urbby como un cambio a mano.
+	 *
+	 * @param bool          $prevent Lo que decidieron otros.
+	 * @param WC_Order_Item $item    Línea.
+	 * @return bool
+	 */
+	public static function prevent_adjust( $prevent, $item ) {
+		if ( $prevent || ! $item instanceof WC_Order_Item_Product ) {
+			return $prevent;
+		}
+		$order = $item->get_order();
+		if ( $order && $order->get_meta( Urbby_WC_Orders::META_FULFILLMENT ) ) {
+			return true;
+		}
+		return '' !== self::variant_of_item( $item );
+	}
+
+	/**
 	 * Da por hecha una venta de la tienda Woo: confirma su reserva (o aparta y confirma si no tenía,
 	 * como una orden creada a mano en el admin) y descuenta localmente las líneas que no están en Urbby.
-	 * Idempotente.
+	 * Idempotente, y relee la orden: un reintento sobre una orden que mientras tanto se canceló no hace
+	 * nada.
 	 *
 	 * @param int $order_id Orden.
 	 */
 	public static function settle( $order_id ) {
 		$order = wc_get_order( $order_id );
-		if ( self::$settling || ! $order || $order->get_meta( Urbby_WC_Orders::META_FULFILLMENT ) || 'confirmed' === $order->get_meta( self::ORDER_STATE ) ) {
+		if ( self::$settling || ! $order || $order->get_meta( Urbby_WC_Orders::META_FULFILLMENT ) || ! in_array( $order->get_status(), self::SOLD, true ) ) {
 			return;
 		}
 		if ( ! self::urbby_lines( $order ) ) {
@@ -215,6 +310,11 @@ final class Urbby_WC_Stock {
 		}
 		self::$settling = true;
 		try {
+			if ( 'confirmed' === $order->get_meta( self::ORDER_STATE ) ) {
+				// Ya confirmada (p. ej. la orden volvió a «pendiente» y Woo devolvió sus líneas locales).
+				self::reduce_local_lines( $order );
+				return;
+			}
 			self::settle_locked( $order );
 		} finally {
 			self::$settling = false;
@@ -234,7 +334,7 @@ final class Urbby_WC_Stock {
 				$order->save();
 				$id = '';
 			} elseif ( ! $res->ok() ) {
-				self::retry( self::ACTION_SETTLE, $order, 'no se pudo confirmar el stock con Urbby (' . $res->message() . ')' );
+				self::fail( self::ACTION_SETTLE, $order, $res, 'no se pudo confirmar el stock con Urbby' );
 				return;
 			}
 		}
@@ -245,25 +345,27 @@ final class Urbby_WC_Stock {
 					$order->update_status( 'on-hold', 'Urbby no tiene stock para esta venta: ' . self::checkout_message( $reserved ) . ' No la despaches sin revisar.' );
 					return;
 				}
-				self::retry( self::ACTION_SETTLE, $order, 'no se pudo apartar el stock en Urbby (' . $reserved->message() . ')' );
+				self::fail( self::ACTION_SETTLE, $order, $reserved, 'no se pudo apartar el stock en Urbby' );
 				return;
 			}
 			$res = Urbby_WC_Api::confirm( (string) $order->get_meta( self::ORDER_RESERVATION ) );
 			if ( ! $res->ok() ) {
-				self::retry( self::ACTION_SETTLE, $order, 'no se pudo confirmar el stock con Urbby (' . $res->message() . ')' );
+				self::fail( self::ACTION_SETTLE, $order, $res, 'no se pudo confirmar el stock con Urbby' );
 				return;
 			}
 		}
 
 		self::reduce_local_lines( $order );
 		$order->update_meta_data( self::ORDER_STATE, 'confirmed' );
+		$order->delete_meta_data( self::ORDER_RETRIES );
 		$order->save();
 		$order->add_order_note( 'Urbby: stock confirmado.' );
 	}
 
 	/**
 	 * Lo que haría Woo con las líneas que no están en Urbby, respetando su ajuste global de inventario.
-	 * Marca la orden como descontada para que Woo, al cancelar, devuelva solo esas líneas.
+	 * Idempotente por `_reduced_stock` de cada línea. Marca la orden como descontada para que Woo, al
+	 * cancelar, devuelva solo esas líneas.
 	 *
 	 * @param WC_Order $order Orden.
 	 */
@@ -271,7 +373,7 @@ final class Urbby_WC_Stock {
 		if ( 'yes' === get_option( 'woocommerce_manage_stock' ) ) {
 			foreach ( $order->get_items() as $item ) {
 				$product = $item instanceof WC_Order_Item_Product ? $item->get_product() : null;
-				if ( ! $product || ! $product->managing_stock() || $item->get_meta( '_reduced_stock', true ) || get_post_meta( $product->get_id(), Urbby_WC_Catalog::META_VARIANT, true ) ) {
+				if ( ! $product || ! $product->managing_stock() || $item->get_meta( '_reduced_stock', true ) || '' !== self::variant_of_item( $item ) ) {
 					continue;
 				}
 				wc_update_product_stock( $product, $item->get_quantity(), 'decrease' );
@@ -283,13 +385,14 @@ final class Urbby_WC_Stock {
 	}
 
 	/**
-	 * Cancelada, fallida o reembolsada: devuelve en Urbby lo que se había apartado o confirmado.
+	 * Cancelada, fallida o reembolsada: devuelve en Urbby lo apartado o confirmado. Relee el estado:
+	 * un reintento sobre una orden que mientras tanto se reabrió no suelta nada.
 	 *
 	 * @param int $order_id Orden.
 	 */
 	public static function release_for_order( $order_id ) {
 		$order = wc_get_order( $order_id );
-		if ( ! $order || $order->get_meta( Urbby_WC_Orders::META_FULFILLMENT ) ) {
+		if ( ! $order || $order->get_meta( Urbby_WC_Orders::META_FULFILLMENT ) || ! in_array( $order->get_status(), self::RELEASED, true ) ) {
 			return;
 		}
 		$id = (string) $order->get_meta( self::ORDER_RESERVATION );
@@ -298,97 +401,185 @@ final class Urbby_WC_Stock {
 		}
 		$res = Urbby_WC_Api::release( $id );
 		if ( ! $res->ok() ) {
-			self::retry( self::ACTION_RELEASE, $order, 'no se pudo devolver el stock en Urbby (' . $res->message() . ')' );
+			self::fail( self::ACTION_RELEASE, $order, $res, 'no se pudo devolver el stock en Urbby' );
 			return;
 		}
 		$order->update_meta_data( self::ORDER_STATE, 'released' );
+		$order->delete_meta_data( self::ORDER_RETRIES );
 		$order->save();
 		$order->add_order_note( 'Urbby: stock devuelto.' );
 		self::display_from_reservation( $res->body );
 	}
 
 	/**
-	 * Reintenta en un minuto y lo deja anotado en la orden (una sola vez por motivo).
+	 * Una orden con su reserva viva que va a la papelera o se borra: la reserva se suelta por su id
+	 * (la orden puede no existir cuando corra la tarea).
 	 *
-	 * @param string   $action Acción a repetir.
-	 * @param WC_Order $order  Orden.
-	 * @param string   $why    Motivo.
+	 * @param int $order_id Orden.
 	 */
-	private static function retry( $action, WC_Order $order, $why ) {
-		$args = array( $order->get_id() );
-		if ( ! as_has_scheduled_action( $action, $args, 'urbby' ) ) {
-			as_schedule_single_action( time() + 60, $action, $args, 'urbby' );
-			$order->add_order_note( 'Urbby: ' . $why . '. Se reintenta en un minuto.' );
+	public static function release_on_remove( $order_id ) {
+		$order = wc_get_order( $order_id );
+		if ( ! $order || $order->get_meta( Urbby_WC_Orders::META_FULFILLMENT ) ) {
+			return;
 		}
+		$id = (string) $order->get_meta( self::ORDER_RESERVATION );
+		if ( $id && 'released' !== $order->get_meta( self::ORDER_STATE ) ) {
+			self::later( self::ACTION_RELEASE_R, array( $id, 0 ), 1 );
+		}
+	}
+
+	/**
+	 * @param string $reservation_id Reserva.
+	 * @param int    $attempt        Intento.
+	 */
+	public static function release_reservation( $reservation_id, $attempt = 0 ) {
+		$res = Urbby_WC_Api::release( (string) $reservation_id );
+		if ( $res->ok() ) {
+			self::display_from_reservation( $res->body );
+		} elseif ( $res->retryable() ) {
+			self::later( self::ACTION_RELEASE_R, array( (string) $reservation_id, (int) $attempt + 1 ), self::backoff( (int) $attempt + 1 ) );
+		}
+	}
+
+	/**
+	 * Algo con Urbby falló: si se puede reintentar, se reintenta con espera creciente; si no (permiso,
+	 * dato inválido) queda en espera con el motivo, para que lo vea una persona.
+	 *
+	 * @param string            $action Tarea a repetir.
+	 * @param WC_Order          $order  Orden.
+	 * @param Urbby_WC_Response $res    Lo que respondió Urbby.
+	 * @param string            $why    Qué se intentaba.
+	 */
+	private static function fail( $action, WC_Order $order, Urbby_WC_Response $res, $why ) {
 		Urbby_WC_Log::error(
-			'Reintento de stock',
+			'Stock con Urbby',
 			array(
 				'order'  => $order->get_id(),
 				'action' => $action,
+				'status' => $res->status,
+				'code'   => $res->code(),
 			)
 		);
+		if ( ! $res->retryable() ) {
+			$order->add_order_note( 'Urbby: ' . $why . ' (' . $res->message() . '). Revisalo antes de despachar.' );
+			if ( self::ACTION_SETTLE === $action && 'on-hold' !== $order->get_status() ) {
+				$order->update_status( 'on-hold' );
+			}
+			return;
+		}
+		$attempt = (int) $order->get_meta( self::ORDER_RETRIES );
+		$order->update_meta_data( self::ORDER_RETRIES, $attempt + 1 );
+		$order->save();
+		if ( 0 === $attempt ) {
+			$order->add_order_note( 'Urbby: ' . $why . ' (' . $res->message() . '). Se reintenta solo.' );
+		}
+		self::later( $action, array( $order->get_id() ), self::backoff( $attempt ) );
 	}
 
 	// ─────────────────────────────────────────────────────────── cambios a mano en Woo
 
 	/**
-	 * Un cambio de stock que no hicimos nosotros (el comercio lo editó, un importador) se manda a Urbby
-	 * como diferencia contra lo último que copiamos de Urbby.
+	 * Un cambio de stock que no hicimos nosotros (el comercio lo editó, un importador) se encola para
+	 * mandarlo a Urbby. En segundo plano: un importador de 500 productos no hace 500 llamadas en el
+	 * request.
 	 *
 	 * @param WC_Product $product Producto o variación.
 	 */
 	public static function on_stock_set( $product ) {
-		if ( self::$writing || ! $product instanceof WC_Product || ! get_post_meta( $product->get_id(), Urbby_WC_Catalog::META_VARIANT, true ) ) {
+		if ( self::$writing || ! $product instanceof WC_Product || true !== $product->get_manage_stock() || ! get_post_meta( $product->get_id(), Urbby_WC_Catalog::META_VARIANT, true ) ) {
 			return;
 		}
 		if ( '' === (string) get_post_meta( $product->get_id(), self::META_SYNCED, true ) ) {
 			return;
 		}
 		update_post_meta( $product->get_id(), self::META_PENDING, 'yes' );
-		self::push_delta( $product->get_id() );
+		self::later( self::ACTION_DELTA, array( $product->get_id() ), 1 );
 	}
 
 	/**
+	 * Manda a Urbby el número que puso el comercio, CONDICIONADO a que Urbby siga en lo último que
+	 * copiamos (`set` + `expectedStock`). Si Urbby se movió (una venta), se reaplica la diferencia del
+	 * comercio sobre lo que hay. Un reintento después de un timeout no puede aplicar dos veces: si el
+	 * primero llegó, el condicional ya no coincide.
+	 *
 	 * @param int $product_id Producto o variación.
 	 */
 	public static function push_delta( $product_id ) {
 		$product = wc_get_product( $product_id );
 		$variant = $product ? (string) get_post_meta( $product_id, Urbby_WC_Catalog::META_VARIANT, true ) : '';
-		if ( ! $variant ) {
-			delete_post_meta( $product_id, self::META_PENDING );
+		if ( ! $variant || true !== $product->get_manage_stock() ) {
+			self::done_delta( $product_id );
 			return;
 		}
-		$delta = (int) $product->get_stock_quantity() - (int) get_post_meta( $product_id, self::META_SYNCED, true );
-		if ( 0 === $delta ) {
-			delete_post_meta( $product_id, self::META_PENDING );
+		$expected = (int) get_post_meta( $product_id, self::META_SYNCED, true );
+		$target   = (int) $product->get_stock_quantity();
+		if ( $target === $expected ) {
+			self::done_delta( $product_id );
 			return;
 		}
-		$res = Urbby_WC_Api::bulk_stock( array( Urbby_WC_Mapper::stock_delta_row( $variant, $delta ) ) );
-		if ( ! $res->ok() ) {
-			if ( $res->retryable() && ! as_has_scheduled_action( self::ACTION_DELTA, array( (int) $product_id ), 'urbby' ) ) {
-				as_schedule_single_action( time() + 60, self::ACTION_DELTA, array( (int) $product_id ), 'urbby' );
-			}
-			Urbby_WC_Log::error(
-				'No se pudo mandar un cambio de stock a Urbby.',
+
+		for ( $i = 0; $i < 3; $i++ ) {
+			$target = max( 0, $target );
+			$res    = Urbby_WC_Api::bulk_stock(
 				array(
-					'product' => $product_id,
-					'status'  => $res->status,
+					array(
+						'variantId'     => $variant,
+						'mode'          => 'set',
+						'amount'        => $target,
+						'expectedStock' => $expected,
+					),
 				)
 			);
-			return;
+			if ( ! $res->ok() ) {
+				if ( $res->retryable() ) {
+					// Sin respuesta no se sabe si llegó: el próximo intento lo descubre por el condicional.
+					update_post_meta( $product_id, self::META_INFLIGHT, 'yes' );
+					self::later( self::ACTION_DELTA, array( (int) $product_id ), 120 );
+				} else {
+					update_post_meta( $product_id, Urbby_WC_Catalog::META_ERROR, 'Urbby no aceptó el cambio de stock: ' . $res->message() );
+					self::done_delta( $product_id );
+				}
+				return;
+			}
+			$row = isset( $res->body['results'][0] ) ? $res->body['results'][0] : array();
+			if ( isset( $row['status'] ) && 'applied' === $row['status'] ) {
+				self::write_display( $product, (int) $row['stock'] );
+				self::done_delta( $product_id );
+				return;
+			}
+			$code    = isset( $row['error']['code'] ) ? $row['error']['code'] : '';
+			$current = isset( $row['error']['details']['currentStock'] ) ? (int) $row['error']['details']['currentStock'] : null;
+			if ( 'STOCK_CHANGED' !== $code || null === $current ) {
+				update_post_meta( $product_id, Urbby_WC_Catalog::META_ERROR, 'Urbby no aceptó el cambio de stock: ' . ( isset( $row['error']['message'] ) ? $row['error']['message'] : 'error' ) );
+				self::done_delta( $product_id );
+				return;
+			}
+			if ( $current === $target ) {
+				// Un intento anterior sin respuesta sí había llegado.
+				self::write_display( $product, $current );
+				self::done_delta( $product_id );
+				return;
+			}
+			if ( get_post_meta( $product_id, self::META_INFLIGHT, true ) ) {
+				// Hubo un intento sin respuesta y Urbby además se movió: no hay forma de saber si aquel llegó.
+				update_post_meta( $product_id, Urbby_WC_Catalog::META_ERROR, 'No sabemos si Urbby recibió tu último cambio de stock (de ' . $expected . ' a ' . $target . '). Revisá el stock de este producto en Urbby.' );
+				self::write_display( $product, $current );
+				self::done_delta( $product_id );
+				return;
+			}
+			// Urbby vendió o apartó mientras tanto: la diferencia del comercio va sobre lo que hay.
+			$target   = $current + ( $target - $expected );
+			$expected = $current;
 		}
-		$row = isset( $res->body['results'][0] ) ? $res->body['results'][0] : array();
+		self::later( self::ACTION_DELTA, array( (int) $product_id ), 60 );
+	}
+
+	/**
+	 * @param int $product_id Producto o variación.
+	 */
+	private static function done_delta( $product_id ) {
 		delete_post_meta( $product_id, self::META_PENDING );
-		if ( isset( $row['status'] ) && 'applied' === $row['status'] ) {
-			self::write_display( $product, (int) $row['stock'] );
-			return;
-		}
-		// Urbby vendió en el medio y la resta dejaría negativo: manda lo que hay en Urbby.
-		$current = isset( $row['error']['details']['currentStock'] ) ? (int) $row['error']['details']['currentStock'] : null;
-		update_post_meta( $product_id, Urbby_WC_Catalog::META_ERROR, 'Urbby no aceptó el cambio de stock: ' . ( isset( $row['error']['message'] ) ? $row['error']['message'] : 'error' ) );
-		if ( null !== $current ) {
-			self::write_display( $product, $current );
-		}
+		delete_post_meta( $product_id, self::META_INFLIGHT );
 	}
 
 	// ─────────────────────────────────────────────────────────── copia local del stock de Urbby
@@ -414,27 +605,10 @@ final class Urbby_WC_Stock {
 	}
 
 	/**
-	 * Trae de Urbby el stock de esos productos y lo copia a Woo. Una llamada por producto.
-	 *
-	 * @param string[] $urbby_product_ids Productos de Urbby.
+	 * @param array|null $reservation Reserva de Urbby.
 	 */
-	public static function refresh_products( array $urbby_product_ids ) {
-		foreach ( $urbby_product_ids as $id ) {
-			$res = Urbby_WC_Api::product( $id );
-			if ( ! $res->ok() ) {
-				continue; // La sincronización de cada 30 min lo cubre.
-			}
-			foreach ( (array) $res->body['variants'] as $variant ) {
-				self::write_display_for_variant( $variant['id'], (int) $variant['stock'] );
-			}
-		}
-	}
-
-	/**
-	 * @param array $reservation Reserva de Urbby.
-	 */
-	private static function display_from_reservation( array $reservation ) {
-		foreach ( isset( $reservation['lines'] ) ? (array) $reservation['lines'] : array() as $line ) {
+	private static function display_from_reservation( $reservation ) {
+		foreach ( is_array( $reservation ) && isset( $reservation['lines'] ) ? (array) $reservation['lines'] : array() as $line ) {
 			self::write_display_for_variant( $line['variantId'], (int) $line['stock'] );
 		}
 	}
@@ -460,19 +634,47 @@ final class Urbby_WC_Stock {
 	}
 
 	/**
-	 * Variante de Urbby → producto o variación de Woo. Una consulta para todo el catálogo.
+	 * Variante de Urbby → producto o variación de Woo. Una consulta por request.
 	 *
 	 * @return array<string,int>
 	 */
 	public static function variant_map() {
+		if ( null !== self::$map ) {
+			return self::$map;
+		}
 		global $wpdb;
 		// phpcs:ignore WordPress.DB.DirectDatabaseQuery -- Un solo SELECT por índice de meta_key; no hay API para leer este mapa entero.
-		$rows = $wpdb->get_results( $wpdb->prepare( "SELECT post_id, meta_value FROM {$wpdb->postmeta} WHERE meta_key = %s", Urbby_WC_Catalog::META_VARIANT ) );
-		$map  = array();
+		$rows      = $wpdb->get_results( $wpdb->prepare( "SELECT post_id, meta_value FROM {$wpdb->postmeta} WHERE meta_key = %s ORDER BY post_id", Urbby_WC_Catalog::META_VARIANT ) );
+		self::$map = array();
 		foreach ( $rows as $row ) {
-			$map[ $row->meta_value ] = (int) $row->post_id;
+			// Ante un duplicado gana el más viejo: el original, no una copia.
+			if ( ! isset( self::$map[ $row->meta_value ] ) ) {
+				self::$map[ $row->meta_value ] = (int) $row->post_id;
+			}
 		}
-		return $map;
+		return self::$map;
+	}
+
+	/** Olvida el mapa del request (se vinculó o desvinculó una variante). */
+	public static function forget_map() {
+		self::$map = null;
+	}
+
+	/**
+	 * Trae de Urbby el stock de esos productos y lo copia a Woo. Una llamada por producto.
+	 *
+	 * @param string[] $urbby_product_ids Productos de Urbby.
+	 */
+	public static function refresh_products( $urbby_product_ids ) {
+		foreach ( (array) $urbby_product_ids as $id ) {
+			$res = Urbby_WC_Api::product( (string) $id );
+			if ( ! $res->ok() ) {
+				continue; // La sincronización de cada 30 min lo cubre.
+			}
+			foreach ( (array) $res->body['variants'] as $variant ) {
+				self::write_display_for_variant( $variant['id'], (int) $variant['stock'] );
+			}
+		}
 	}
 
 	/**

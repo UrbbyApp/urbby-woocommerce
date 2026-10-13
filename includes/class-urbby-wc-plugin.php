@@ -31,7 +31,10 @@ final class Urbby_WC_Plugin {
 		}
 		add_action( 'init', array( __CLASS__, 'register_statuses' ) );
 		add_filter( 'wc_order_statuses', array( __CLASS__, 'order_statuses' ) );
-		add_action( 'action_scheduler_init', array( __CLASS__, 'ensure_schedules' ) );
+		// Solo en el admin y en el cron: no en cada visita a la tienda.
+		if ( is_admin() || wp_doing_cron() ) {
+			add_action( 'action_scheduler_init', array( __CLASS__, 'ensure_schedules' ) );
+		}
 	}
 
 	public static function register_statuses() {
@@ -97,7 +100,7 @@ final class Urbby_WC_Plugin {
 
 	public static function deactivate() {
 		if ( function_exists( 'as_unschedule_all_actions' ) ) {
-			foreach ( array( Urbby_WC_Stock::ACTION_SYNC, Urbby_WC_Stock::ACTION_SYNC_PAGE, Urbby_WC_Orders::ACTION_RECONCILE, Urbby_WC_Catalog::ACTION_PUSH ) as $hook ) {
+			foreach ( array( Urbby_WC_Stock::ACTION_SYNC, Urbby_WC_Stock::ACTION_SYNC_PAGE, Urbby_WC_Orders::ACTION_RECONCILE, Urbby_WC_Catalog::ACTION_PUSH, Urbby_WC_Stock::ACTION_REFRESH ) as $hook ) {
 				as_unschedule_all_actions( $hook, null, 'urbby' );
 			}
 		}

@@ -1,7 +1,7 @@
 <?php
 /**
- * Catálogo de Woo → Urbby: contenido y precio. El stock solo viaja la primera vez (la migración):
- * desde ahí lo lleva Urbby.
+ * Catálogo de Woo → Urbby: contenido y precio. El stock solo viaja cuando el producto (o una variación
+ * nueva) llega a Urbby por primera vez: es la migración. Desde ahí lo lleva Urbby.
  *
  * @package UrbbyWooCommerce
  */
@@ -19,6 +19,9 @@ final class Urbby_WC_Catalog {
 	const META_IMAGES  = '_urbby_images_hash';
 	const ACTION_PUSH  = 'urbby_wc_push_products';
 
+	/** Todo lo que el plugin guarda en un producto: lo que una copia del producto no debe heredar. */
+	const OWN_META = array( self::META_PRODUCT, self::META_VARIANT, self::META_ERROR, self::META_IMAGES, Urbby_WC_Stock::META_SYNCED, Urbby_WC_Stock::META_PENDING, Urbby_WC_Stock::META_INFLIGHT );
+
 	/** Lo que Urbby acepta por producto. */
 	const MAX_OPTIONS  = 3;
 	const MAX_VARIANTS = 12;
@@ -30,7 +33,20 @@ final class Urbby_WC_Catalog {
 		add_action( 'woocommerce_new_product_variation', array( __CLASS__, 'queue_variation' ) );
 		add_action( 'woocommerce_update_product_variation', array( __CLASS__, 'queue_variation' ) );
 		add_action( 'trashed_post', array( __CLASS__, 'queue' ) );
+		add_action( 'woocommerce_product_duplicate_before_save', array( __CLASS__, 'forget_on_duplicate' ) );
 		add_action( self::ACTION_PUSH, array( __CLASS__, 'push' ) );
+	}
+
+	/**
+	 * Duplicar un producto en Woo copia sus meta: la copia quedaba cruzada con las variantes del original
+	 * y le robaba el stock. La copia nace sin vínculo, como un producto nuevo.
+	 *
+	 * @param WC_Product $duplicate Copia (o variación de la copia) antes de guardarse.
+	 */
+	public static function forget_on_duplicate( $duplicate ) {
+		foreach ( self::OWN_META as $key ) {
+			$duplicate->delete_meta_data( $key );
+		}
 	}
 
 	/**
@@ -43,10 +59,7 @@ final class Urbby_WC_Catalog {
 		if ( Urbby_WC_Stock::$writing || ! Urbby_WC_Settings::connected() || 'product' !== get_post_type( $product_id ) ) {
 			return;
 		}
-		$args = array( array( (int) $product_id ) );
-		if ( ! as_has_scheduled_action( self::ACTION_PUSH, $args, 'urbby' ) ) {
-			as_schedule_single_action( time() + 10, self::ACTION_PUSH, $args, 'urbby' );
-		}
+		Urbby_WC_Stock::later( self::ACTION_PUSH, array( array( (int) $product_id ) ), 10 );
 	}
 
 	/**
@@ -88,6 +101,7 @@ final class Urbby_WC_Catalog {
 	public static function push( $ids ) {
 		$items = array();
 		$sent  = array();
+		$later = array();
 		foreach ( (array) $ids as $id ) {
 			$product = wc_get_product( $id );
 			if ( ! $product ) {
@@ -95,7 +109,9 @@ final class Urbby_WC_Catalog {
 			}
 			$built = self::build( $product );
 			if ( is_wp_error( $built ) ) {
-				if ( 'skip' !== $built->get_error_code() ) {
+				if ( 'retry' === $built->get_error_code() ) {
+					$later[] = (int) $id;
+				} elseif ( 'skip' !== $built->get_error_code() ) {
 					update_post_meta( $product->get_id(), self::META_ERROR, $built->get_error_message() );
 				}
 				continue;
@@ -105,6 +121,10 @@ final class Urbby_WC_Catalog {
 				'product'     => $product,
 				'images_hash' => $built['images_hash'],
 			);
+		}
+		if ( $later ) {
+			// Urbby no contestó al leer el producto: sin saber qué hay, no se manda nada que pise su stock.
+			Urbby_WC_Stock::later( self::ACTION_PUSH, array( $later ), 300 );
 		}
 		if ( ! $items ) {
 			return;
@@ -120,7 +140,7 @@ final class Urbby_WC_Catalog {
 				)
 			);
 			if ( $res->retryable() ) {
-				as_schedule_single_action( time() + 300, self::ACTION_PUSH, array( array_map( 'intval', (array) $ids ) ), 'urbby' );
+				Urbby_WC_Stock::later( self::ACTION_PUSH, array( array_map( 'intval', (array) $ids ) ), 300 );
 			}
 			return;
 		}
@@ -132,25 +152,17 @@ final class Urbby_WC_Catalog {
 			}
 			$product = $entry['product'];
 			if ( 'failed' === $row['status'] ) {
-				update_post_meta( $product->get_id(), self::META_ERROR, self::row_error( $row ) );
+				update_post_meta( $product->get_id(), self::META_ERROR, isset( $row['error']['message'] ) ? $row['error']['message'] : 'Urbby rechazó este producto.' );
 				continue;
 			}
 			update_post_meta( $product->get_id(), self::META_PRODUCT, $row['productId'] );
 			update_post_meta( $product->get_id(), self::META_IMAGES, $entry['images_hash'] );
 			delete_post_meta( $product->get_id(), self::META_ERROR );
-			self::link_variants( $product, $row['productId'] );
+			if ( ! self::link_variants( $product, $row['productId'] ) ) {
+				update_post_meta( $product->get_id(), self::META_ERROR, 'Falta terminar de vincularlo con Urbby. Se reintenta solo.' );
+				Urbby_WC_Stock::later( self::ACTION_PUSH, array( array( $product->get_id() ) ), 300 );
+			}
 		}
-	}
-
-	/**
-	 * El mensaje de una fila fallida, con el primer campo que Urbby objetó.
-	 *
-	 * @param array $row Resultado de la fila.
-	 * @return string
-	 */
-	private static function row_error( array $row ) {
-		$message = isset( $row['error']['message'] ) ? $row['error']['message'] : 'Urbby rechazó este producto.';
-		return $message;
 	}
 
 	/**
@@ -159,6 +171,7 @@ final class Urbby_WC_Catalog {
 	 *
 	 * @param WC_Product $product          Producto de Woo.
 	 * @param string     $urbby_product_id Producto de Urbby.
+	 * @return bool Si quedó todo vinculado.
 	 */
 	public static function link_variants( WC_Product $product, $urbby_product_id ) {
 		$res = Urbby_WC_Api::product( $urbby_product_id );
@@ -170,26 +183,35 @@ final class Urbby_WC_Catalog {
 					'status'  => $res->status,
 				)
 			);
-			return;
+			return false;
 		}
+		return self::link_from( $product, $res->body['variants'] );
+	}
+
+	/**
+	 * @param WC_Product $product  Producto de Woo.
+	 * @param array      $variants Variantes vivas del producto en Urbby.
+	 * @return bool Si quedó todo vinculado.
+	 */
+	private static function link_from( WC_Product $product, array $variants ) {
 		if ( ! $product->is_type( 'variable' ) ) {
-			self::link( $product, $res->body['variants'][0] );
-			return;
+			self::link( $product, $variants[0] );
+			return true;
 		}
 		$by_key = array();
-		foreach ( $res->body['variants'] as $v ) {
+		foreach ( $variants as $v ) {
 			$by_key[ Urbby_WC_Mapper::option_key( array( $v['option1'], $v['option2'], $v['option3'] ) ) ] = $v;
 		}
-		foreach ( $product->get_children() as $variation_id ) {
-			$variation = wc_get_product( $variation_id );
-			if ( ! $variation ) {
-				continue;
-			}
+		$all = true;
+		foreach ( self::active_variations( $product ) as $variation ) {
 			$key = Urbby_WC_Mapper::option_key( self::variation_values( $product, $variation ) );
 			if ( isset( $by_key[ $key ] ) ) {
 				self::link( $variation, $by_key[ $key ] );
+			} else {
+				$all = false;
 			}
 		}
+		return $all;
 	}
 
 	/**
@@ -198,7 +220,57 @@ final class Urbby_WC_Catalog {
 	 */
 	private static function link( WC_Product $woo, array $variant ) {
 		update_post_meta( $woo->get_id(), self::META_VARIANT, $variant['id'] );
-		Urbby_WC_Stock::write_display( $woo, (int) $variant['stock'] );
+		Urbby_WC_Stock::forget_map();
+		// Un cambio a mano esperando subir manda: copiar el número de Urbby lo borraría.
+		if ( ! get_post_meta( $woo->get_id(), Urbby_WC_Stock::META_PENDING, true ) ) {
+			Urbby_WC_Stock::write_display( $woo, (int) $variant['stock'] );
+		}
+	}
+
+	/**
+	 * @param WC_Product $woo Producto simple o variación.
+	 */
+	private static function unlink( WC_Product $woo ) {
+		foreach ( array( self::META_VARIANT, Urbby_WC_Stock::META_SYNCED, Urbby_WC_Stock::META_PENDING, Urbby_WC_Stock::META_INFLIGHT ) as $key ) {
+			delete_post_meta( $woo->get_id(), $key );
+		}
+		Urbby_WC_Stock::forget_map();
+	}
+
+	/**
+	 * Está en Urbby con todas sus variaciones activas vinculadas. Lo que muestra la columna «Urbby».
+	 *
+	 * @param WC_Product $product Producto.
+	 * @return bool
+	 */
+	public static function fully_linked( WC_Product $product ) {
+		if ( ! get_post_meta( $product->get_id(), self::META_PRODUCT, true ) ) {
+			return false;
+		}
+		if ( ! $product->is_type( 'variable' ) ) {
+			return (bool) get_post_meta( $product->get_id(), self::META_VARIANT, true );
+		}
+		foreach ( self::active_variations( $product ) as $variation ) {
+			if ( ! get_post_meta( $variation->get_id(), self::META_VARIANT, true ) ) {
+				return false;
+			}
+		}
+		return true;
+	}
+
+	/**
+	 * @param WC_Product $product Producto variable.
+	 * @return WC_Product[] Las variaciones habilitadas.
+	 */
+	private static function active_variations( WC_Product $product ) {
+		$out = array();
+		foreach ( $product->get_children() as $variation_id ) {
+			$variation = wc_get_product( $variation_id );
+			if ( $variation && 'publish' === $variation->get_status() ) {
+				$out[] = $variation;
+			}
+		}
+		return $out;
 	}
 
 	/**
@@ -236,18 +308,66 @@ final class Urbby_WC_Catalog {
 	}
 
 	/**
+	 * Para un producto que ya está en Urbby: vincula lo que falte contra lo que hay allá ANTES de armar
+	 * la fila, así una variación sin vincular no viaja con el stock de Woo (pisaría el de Urbby), y
+	 * suelta el vínculo de una variante que Urbby ya no tiene viva (se deshabilitó y se volvió a
+	 * habilitar). Devuelve false si Urbby no contestó; si el producto ya no existe en Urbby, lo olvida.
+	 *
+	 * @param WC_Product $product Producto con `META_PRODUCT`.
+	 * @return bool|null true listo, false reintentar, null el producto ya no está en Urbby.
+	 */
+	private static function reconcile_links( WC_Product $product ) {
+		$res = Urbby_WC_Api::product( (string) get_post_meta( $product->get_id(), self::META_PRODUCT, true ) );
+		if ( 404 === $res->status ) {
+			delete_post_meta( $product->get_id(), self::META_PRODUCT );
+			self::unlink( $product );
+			foreach ( $product->is_type( 'variable' ) ? self::active_variations( $product ) : array() as $variation ) {
+				self::unlink( $variation );
+			}
+			return null;
+		}
+		if ( ! $res->ok() ) {
+			return false;
+		}
+		$variants = (array) $res->body['variants'];
+		$live     = array();
+		foreach ( $variants as $v ) {
+			$live[ $v['id'] ] = true;
+		}
+		$own = $product->is_type( 'variable' ) ? self::active_variations( $product ) : array( $product );
+		foreach ( $own as $woo ) {
+			$id = (string) get_post_meta( $woo->get_id(), self::META_VARIANT, true );
+			if ( '' !== $id && ! isset( $live[ $id ] ) ) {
+				self::unlink( $woo );
+			}
+		}
+		if ( $variants ) {
+			self::link_from( $product, $variants );
+		}
+		return true;
+	}
+
+	/**
 	 * La fila de Urbby para un producto, o un error con el motivo para el comercio.
 	 *
 	 * @param WC_Product $product Producto.
 	 * @return array|WP_Error `[ 'item' => array, 'images_hash' => string ]`.
 	 */
 	public static function build( WC_Product $product ) {
-		$id     = $product->get_id();
-		$mapped = (bool) get_post_meta( $id, self::META_PRODUCT, true );
+		$id = $product->get_id();
 
 		if ( ! $product->is_type( 'simple' ) && ! $product->is_type( 'variable' ) ) {
 			return new WP_Error( 'unsupported', 'Urbby recibe productos simples y variables.' );
 		}
+		$mapped = (bool) get_post_meta( $id, self::META_PRODUCT, true );
+		if ( $mapped ) {
+			$linked = self::reconcile_links( $product );
+			if ( false === $linked ) {
+				return new WP_Error( 'retry', '' );
+			}
+			$mapped = null !== $linked;
+		}
+
 		$post_status = $product->get_status();
 		if ( 'trash' === $post_status ) {
 			if ( ! $mapped ) {
@@ -287,7 +407,7 @@ final class Urbby_WC_Catalog {
 			$item['imageUrls'] = $urls;
 		}
 
-		$extra = $product->is_type( 'variable' ) ? self::build_variable( $product ) : self::build_simple( $product );
+		$extra = $product->is_type( 'variable' ) ? self::build_variable( $product ) : self::build_simple( $product, $mapped );
 		if ( is_wp_error( $extra ) ) {
 			return $extra;
 		}
@@ -299,9 +419,10 @@ final class Urbby_WC_Catalog {
 
 	/**
 	 * @param WC_Product $product Producto simple.
+	 * @param bool       $mapped  Ya está en Urbby.
 	 * @return array|WP_Error
 	 */
-	private static function build_simple( WC_Product $product ) {
+	private static function build_simple( WC_Product $product, $mapped ) {
 		$prices = self::prices( $product );
 		if ( is_wp_error( $prices ) ) {
 			return $prices;
@@ -309,14 +430,18 @@ final class Urbby_WC_Catalog {
 		if ( true !== $product->get_manage_stock() ) {
 			return new WP_Error( 'stock', 'Activá «Gestionar inventario» en este producto: Urbby necesita la cantidad.' );
 		}
-		// Solo la primera vez: es la migración del stock de Woo a Urbby. Después manda Urbby.
-		if ( ! get_post_meta( $product->get_id(), self::META_VARIANT, true ) ) {
+		// Solo cuando llega a Urbby por primera vez: es la migración del stock de Woo. Después manda Urbby.
+		if ( ! $mapped ) {
 			$prices['stock'] = max( 0, (int) $product->get_stock_quantity() );
 		}
 		return $prices;
 	}
 
 	/**
+	 * Las variaciones deshabilitadas no van: Urbby no tiene «deshabilitada» y las que no vienen las
+	 * saca de la venta. Al volver a habilitarla, `reconcile_links` ya le soltó el vínculo viejo y va
+	 * como nueva.
+	 *
 	 * @param WC_Product $product Producto variable.
 	 * @return array|WP_Error
 	 */
@@ -338,11 +463,7 @@ final class Urbby_WC_Catalog {
 		$variants  = array();
 		$min_cents = null;
 		$min_price = null;
-		foreach ( $product->get_children() as $variation_id ) {
-			$variation = wc_get_product( $variation_id );
-			if ( ! $variation || 'publish' !== $variation->get_status() ) {
-				continue;
-			}
+		foreach ( self::active_variations( $product ) as $variation ) {
 			$values = self::variation_values( $product, $variation );
 			if ( in_array( '', $values, true ) ) {
 				return new WP_Error( 'any', 'Una variación acepta «cualquier» valor de un atributo: Urbby necesita cada combinación por separado.' );
@@ -363,10 +484,11 @@ final class Urbby_WC_Catalog {
 				),
 				$prices
 			);
-			$urbby_id = get_post_meta( $variation_id, self::META_VARIANT, true );
+			$urbby_id = get_post_meta( $variation->get_id(), self::META_VARIANT, true );
 			if ( $urbby_id ) {
 				$row['id'] = $urbby_id;
 			} else {
+				// Variación que Urbby todavía no tiene (ya se intentó vincular contra lo que hay allá).
 				$row['stock'] = max( 0, (int) $variation->get_stock_quantity() );
 			}
 			$variants[] = $row;

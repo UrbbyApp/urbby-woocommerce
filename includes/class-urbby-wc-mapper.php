@@ -75,20 +75,23 @@ final class Urbby_WC_Mapper {
 	}
 
 	/**
-	 * La `reference` de la reserva de una orden de Woo. Cambia si cambian las líneas (el cliente
-	 * volvió al carrito): la misma orden con otras líneas es otra reserva.
+	 * La `reference` de la reserva de una orden de Woo. Lleva el sitio: una copia de la tienda (un
+	 * staging clonado con las mismas credenciales) numera sus órdenes igual, y sin esto su orden 42
+	 * reutilizaba la reserva de la orden 42 real. Cambia si cambian las líneas (el cliente volvió al
+	 * carrito): la misma orden con otras líneas es otra reserva.
 	 *
-	 * @param int   $order_id Orden de Woo.
-	 * @param array $lines    `[[ 'variantId' => string, 'quantity' => int ], …]`.
+	 * @param int    $order_id Orden de Woo.
+	 * @param array  $lines    `[[ 'variantId' => string, 'quantity' => int ], …]`.
+	 * @param string $site     `home_url()` de la tienda.
 	 * @return string
 	 */
-	public static function reservation_reference( $order_id, array $lines ) {
+	public static function reservation_reference( $order_id, array $lines, $site ) {
 		$keys = array();
 		foreach ( $lines as $line ) {
 			$keys[] = $line['variantId'] . ':' . (int) $line['quantity'];
 		}
 		sort( $keys );
-		return 'woo-order-' . (int) $order_id . '-' . substr( sha1( implode( ',', $keys ) ), 0, 10 );
+		return 'woo-' . substr( md5( strtolower( rtrim( (string) $site, '/' ) ) ), 0, 8 ) . '-order-' . (int) $order_id . '-' . substr( sha1( implode( ',', $keys ) ), 0, 10 );
 	}
 
 	/**

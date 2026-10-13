@@ -60,13 +60,16 @@ final class Urbby_WC_Admin {
 				'hide_empty' => false,
 			)
 		);
-		// phpcs:ignore WordPress.Security.NonceVerification.Recommended -- Solo muestra el aviso de la acción anterior.
-		$notice = isset( $_GET['urbby_notice'] ) ? sanitize_text_field( wp_unslash( $_GET['urbby_notice'] ) ) : '';
+		$notice     = (string) get_transient( 'urbby_wc_notice_' . get_current_user_id() );
+		delete_transient( 'urbby_wc_notice_' . get_current_user_id() );
 		?>
 		<div class="wrap">
 			<h1>Urbby</h1>
 			<?php if ( $notice ) : ?>
 				<div class="notice notice-info"><p><?php echo esc_html( $notice ); ?></p></div>
+			<?php endif; ?>
+			<?php if ( Urbby_WC_Settings::moved() ) : ?>
+				<div class="notice notice-error"><p>Este sitio no es el que se conectó a Urbby (¿es una copia o cambió de dirección?). No habla con Urbby hasta que guardes la conexión de nuevo desde acá.</p></div>
 			<?php endif; ?>
 			<p>El stock de los productos vinculados vive en Urbby: tu tienda y Urbby descuentan del mismo lugar. Los cambios de stock que hagas acá se mandan a Urbby como diferencia.</p>
 
@@ -76,20 +79,9 @@ final class Urbby_WC_Admin {
 				<h2>Conexión</h2>
 				<table class="form-table" role="presentation">
 					<tr>
-						<th scope="row"><label for="urbby-env">Ambiente</label></th>
-						<td>
-							<select id="urbby-env" name="environment">
-								<?php
-								foreach ( array(
-									'production' => 'Producción',
-									'custom'     => 'Otra URL (pruebas)',
-								) as $value => $label ) :
-									?>
-									<option value="<?php echo esc_attr( $value ); ?>" <?php selected( $s['environment'], $value ); ?>><?php echo esc_html( $label ); ?></option>
-								<?php endforeach; ?>
-							</select>
-							<input type="url" name="api_base" class="regular-text" placeholder="https://…/v1" value="<?php echo esc_attr( $s['api_base'] ); ?>" aria-label="URL del API (solo con Otra URL)">
-						</td>
+						<th scope="row">API</th>
+						<td><code><?php echo esc_html( Urbby_WC_Settings::api_base() ); ?></code>
+						<p class="description">Para pruebas se cambia con la constante <code>URBBY_WC_API_BASE</code> en <code>wp-config.php</code>.</p></td>
 					</tr>
 					<tr>
 						<th scope="row"><label for="urbby-client-id">Client ID</label></th>
@@ -167,8 +159,7 @@ final class Urbby_WC_Admin {
 		check_admin_referer( 'urbby_wc_save' );
 		$post  = wp_unslash( $_POST );
 		$patch = array(
-			'environment'      => in_array( isset( $post['environment'] ) ? $post['environment'] : '', array( 'production', 'custom' ), true ) ? $post['environment'] : 'production',
-			'api_base'         => isset( $post['api_base'] ) ? esc_url_raw( $post['api_base'], array( 'https', 'http' ) ) : '',
+			'site'             => home_url(),
 			'client_id'        => isset( $post['client_id'] ) ? sanitize_text_field( $post['client_id'] ) : '',
 			'hold_minutes'     => isset( $post['hold_minutes'] ) ? min( 1440, max( 1, (int) $post['hold_minutes'] ) ) : 60,
 			'default_category' => isset( $post['default_category'] ) ? sanitize_text_field( $post['default_category'] ) : '',
@@ -198,8 +189,7 @@ final class Urbby_WC_Admin {
 		check_admin_referer( 'urbby_wc_action' );
 		$do = isset( $_POST['do'] ) ? sanitize_key( wp_unslash( $_POST['do'] ) ) : '';
 		if ( 'test' === $do ) {
-			$res = Urbby_WC_Api::request( 'GET', '/public/catalog/products?limit=1' );
-			self::back( $res->ok() ? 'Conexión con Urbby: bien.' : 'Conexión con Urbby: ' . $res->message() );
+			self::back( self::test_connection() );
 		}
 		if ( 'push_all' === $do ) {
 			self::back( 'Se encolaron ' . Urbby_WC_Catalog::push_all() . ' productos para enviar a Urbby. Avanza en segundo plano.' );
@@ -219,16 +209,39 @@ final class Urbby_WC_Admin {
 	 * @param string $notice Aviso para la pantalla.
 	 */
 	private static function back( $notice ) {
-		wp_safe_redirect(
-			add_query_arg(
-				array(
-					'page'         => self::PAGE,
-					'urbby_notice' => rawurlencode( $notice ),
-				),
-				admin_url( 'admin.php' )
-			)
-		);
+		if ( '' !== $notice ) {
+			set_transient( 'urbby_wc_notice_' . get_current_user_id(), $notice, 60 );
+		}
+		wp_safe_redirect( add_query_arg( array( 'page' => self::PAGE ), admin_url( 'admin.php' ) ) );
 		exit;
+	}
+
+	/**
+	 * Prueba la credencial y CADA permiso que el plugin necesita, sin escribir nada: sin
+	 * `inventory:write` toda venta de la tienda falla, y eso tiene que verse acá y no en el checkout.
+	 *
+	 * @return string
+	 */
+	private static function test_connection() {
+		$checks = array(
+			'catalog:read'    => array( 'GET', '/public/catalog/products?limit=1', null, array( 200 ) ),
+			// Un lote vacío no pasa la validación (400): llegar a validar prueba el permiso sin escribir.
+			'catalog:write'   => array( 'POST', '/public/catalog/products/bulk', array( 'items' => array() ), array( 400 ) ),
+			// Una reserva que no existe: 404 con el permiso, 403 sin él.
+			'inventory:write' => array( 'GET', '/public/stock-reservations/00000000-0000-4000-8000-000000000000', null, array( 404 ) ),
+			'orders:read'     => array( 'GET', '/public/orders?limit=1', null, array( 200 ) ),
+		);
+		$missing = array();
+		foreach ( $checks as $scope => $c ) {
+			$res = Urbby_WC_Api::request( $c[0], $c[1], $c[2] );
+			if ( 0 === $res->status || 401 === $res->status ) {
+				return 'Conexión con Urbby: ' . ( 401 === $res->status ? 'la credencial no es válida.' : $res->message() );
+			}
+			if ( ! in_array( $res->status, $c[3], true ) ) {
+				$missing[] = $scope;
+			}
+		}
+		return $missing ? 'Conexión con Urbby: a la credencial le faltan permisos: ' . implode( ', ', $missing ) . '. Creá otra en el portal de Urbby con todos.' : 'Conexión con Urbby: bien, con todos los permisos.';
 	}
 
 	/**
@@ -251,8 +264,10 @@ final class Urbby_WC_Admin {
 		$error = get_post_meta( $post_id, Urbby_WC_Catalog::META_ERROR, true );
 		if ( $error ) {
 			echo '<span style="color:#b32d2e">' . esc_html( $error ) . '</span>';
-		} elseif ( get_post_meta( $post_id, Urbby_WC_Catalog::META_PRODUCT, true ) ) {
+		} elseif ( wc_get_product( $post_id ) && Urbby_WC_Catalog::fully_linked( wc_get_product( $post_id ) ) ) {
 			echo '<span aria-label="Vinculado">✓</span>';
+		} elseif ( get_post_meta( $post_id, Urbby_WC_Catalog::META_PRODUCT, true ) ) {
+			echo '<span>Vinculando…</span>';
 		} else {
 			echo '<span aria-label="No enviado">—</span>';
 		}

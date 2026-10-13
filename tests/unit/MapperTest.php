@@ -60,16 +60,19 @@ final class MapperTest extends TestCase {
 		$this->assertFalse( Urbby_WC_Mapper::verify_signature( $body, hash_hmac( 'sha256', $body, '' ), '' ) );
 	}
 
-	public function test_la_reference_es_estable_y_cambia_si_cambian_las_lineas() {
-		$a = array(
+	public function test_la_reference_es_estable_y_cambia_si_cambian_las_lineas_o_el_sitio() {
+		$a    = array(
 			array( 'variantId' => 'v1', 'quantity' => 2 ),
 			array( 'variantId' => 'v2', 'quantity' => 1 ),
 		);
-		$ref = Urbby_WC_Mapper::reservation_reference( 42, $a );
-		$this->assertStringStartsWith( 'woo-order-42-', $ref );
-		$this->assertSame( $ref, Urbby_WC_Mapper::reservation_reference( 42, array_reverse( $a ) ), 'el orden de las líneas no importa' );
-		$this->assertNotSame( $ref, Urbby_WC_Mapper::reservation_reference( 42, array( array( 'variantId' => 'v1', 'quantity' => 3 ) ) ) );
-		$this->assertNotSame( $ref, Urbby_WC_Mapper::reservation_reference( 43, $a ) );
+		$site = 'https://tienda.com';
+		$ref  = Urbby_WC_Mapper::reservation_reference( 42, $a, $site );
+		$this->assertMatchesRegularExpression( '/^woo-[0-9a-f]{8}-order-42-[0-9a-f]{10}$/', $ref );
+		$this->assertSame( $ref, Urbby_WC_Mapper::reservation_reference( 42, array_reverse( $a ), $site ), 'el orden de las líneas no importa' );
+		$this->assertSame( $ref, Urbby_WC_Mapper::reservation_reference( 42, $a, 'https://TIENDA.com/' ), 'la barra final y las mayúsculas no importan' );
+		$this->assertNotSame( $ref, Urbby_WC_Mapper::reservation_reference( 42, array( array( 'variantId' => 'v1', 'quantity' => 3 ) ), $site ) );
+		$this->assertNotSame( $ref, Urbby_WC_Mapper::reservation_reference( 43, $a, $site ) );
+		$this->assertNotSame( $ref, Urbby_WC_Mapper::reservation_reference( 42, $a, 'https://staging.tienda.com' ), 'una copia de la tienda no comparte reservas' );
 		$this->assertLessThanOrEqual( 120, strlen( $ref . '-' . time() ), 'cabe en el máximo de Urbby aun con el sufijo de reintento' );
 	}
 

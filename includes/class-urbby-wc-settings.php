@@ -14,7 +14,7 @@ final class Urbby_WC_Settings {
 
 	const OPTION = 'urbby_wc_settings';
 
-	/** El API de producción. `custom` usa `api_base` tal cual (pruebas). */
+	/** El API de Urbby. Otro (pruebas) solo con la constante `URBBY_WC_API_BASE` en `wp-config.php`. */
 	const PRODUCTION = 'https://api.urbby.app/v1';
 
 	/**
@@ -27,14 +27,13 @@ final class Urbby_WC_Settings {
 		return wp_parse_args(
 			is_array( $saved ) ? $saved : array(),
 			array(
-				'environment'      => 'production',
-				'api_base'         => '',
 				'client_id'        => '',
 				'client_secret'    => '',
 				'webhook_secret'   => '',
 				'hold_minutes'     => 60,
 				'default_category' => '',
 				'category_map'     => array(),
+				'site'             => '',
 			)
 		);
 	}
@@ -49,26 +48,35 @@ final class Urbby_WC_Settings {
 	}
 
 	/**
-	 * La URL base del API, sin barra final.
+	 * La URL base del API, sin barra final. Se cambia solo desde `wp-config.php`: desde la pantalla,
+	 * cualquiera con permiso de gestionar la tienda podía mandar la credencial a otro servidor.
 	 *
 	 * @return string
 	 */
 	public static function api_base() {
-		$s = self::get();
-		if ( 'custom' === $s['environment'] ) {
-			return untrailingslashit( (string) $s['api_base'] );
-		}
-		return self::PRODUCTION;
+		return defined( 'URBBY_WC_API_BASE' ) ? untrailingslashit( (string) URBBY_WC_API_BASE ) : self::PRODUCTION;
 	}
 
 	/**
-	 * Hay credencial para hablar con Urbby.
+	 * Este sitio es otro que el que se conectó: una copia (staging clonado, backup restaurado en otra
+	 * dirección) que heredó la credencial. Mientras no se vuelva a guardar la conexión, no habla con
+	 * Urbby: si no, vendería y movería el stock real desde la copia.
+	 *
+	 * @return bool
+	 */
+	public static function moved() {
+		$s = self::get();
+		return '' !== $s['site'] && untrailingslashit( strtolower( $s['site'] ) ) !== untrailingslashit( strtolower( home_url() ) );
+	}
+
+	/**
+	 * Hay credencial y es este sitio.
 	 *
 	 * @return bool
 	 */
 	public static function connected() {
 		$s = self::get();
-		return '' !== $s['client_id'] && '' !== $s['client_secret'];
+		return '' !== $s['client_id'] && '' !== $s['client_secret'] && ! self::moved();
 	}
 
 	/**

@@ -32,14 +32,14 @@ final class Urbby_WC_Response {
 		$this->network_error = $network_error;
 	}
 
-	/** @return bool */
+	/** @return bool 2xx CON cuerpo JSON: un 200 con HTML (un proxy, una página de error) no es una respuesta de Urbby. */
 	public function ok() {
-		return $this->status >= 200 && $this->status < 300;
+		return $this->status >= 200 && $this->status < 300 && null !== $this->body;
 	}
 
-	/** @return bool Sin respuesta o error de Urbby: se puede reintentar. */
+	/** @return bool Sin respuesta, error de Urbby o respuesta que no es de Urbby: se puede reintentar. */
 	public function retryable() {
-		return 0 === $this->status || $this->status >= 500 || 429 === $this->status;
+		return 0 === $this->status || $this->status >= 500 || 429 === $this->status || ( $this->status < 300 && null === $this->body );
 	}
 
 	/** @return string El `code` del error de Urbby, o '' si no hay. */
