@@ -180,4 +180,18 @@ final class MapperTest extends TestCase {
 			$this->assertSame( $c[2], Urbby_WC_Mapper::cancel_outcome( new Urbby_WC_Response( $c[0], $c[1] ) ), $nombre );
 		}
 	}
+
+	public function test_contra_entrega_se_reconoce_solo_por_cod() {
+		$this->assertTrue( Urbby_WC_Mapper::is_cod( array( 'paymentMethod' => 'cod' ) ) );
+		$this->assertFalse( Urbby_WC_Mapper::is_cod( array( 'paymentMethod' => 'card' ) ) );
+		$this->assertFalse( Urbby_WC_Mapper::is_cod( array() ) );
+	}
+
+	public function test_contra_entrega_cuenta_como_pagada_solo_al_completarse() {
+		// Woo propone `processing`: para el contra entrega «pagada» es `completed` (D3: se cobra al entregar).
+		$this->assertSame( 'completed', Urbby_WC_Mapper::paid_status( true, 'processing' ) );
+		$this->assertSame( 'completed', Urbby_WC_Mapper::paid_status( true, 'completed' ) );
+		// Lo ya cobrado en Urbby conserva el comportamiento de Woo.
+		$this->assertSame( 'processing', Urbby_WC_Mapper::paid_status( false, 'processing' ) );
+	}
 }

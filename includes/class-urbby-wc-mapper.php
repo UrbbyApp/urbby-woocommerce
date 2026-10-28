@@ -47,6 +47,29 @@ final class Urbby_WC_Mapper {
 	}
 
 	/**
+	 * ¿El pedido se cobra contra entrega? Un pedido sin `paymentMethod` o con otro valor (tarjeta,
+	 * ya cobrada en Urbby) no lo es: así el default es el comportamiento normal de Woo.
+	 *
+	 * @param array $fulfillment El pedido.
+	 * @return bool
+	 */
+	public static function is_cod( array $fulfillment ) {
+		return isset( $fulfillment['paymentMethod'] ) && 'cod' === $fulfillment['paymentMethod'];
+	}
+
+	/**
+	 * El estado de Woo en el que una orden cuenta como «pagada» (el que fija `date_paid`). Woo usa
+	 * `processing`, pero el contra entrega se cobra al entregar: ahí es `completed`. El resto, sin tocar.
+	 *
+	 * @param bool   $cod     Si la orden es contra entrega.
+	 * @param string $proposed El estado que propone Woo.
+	 * @return string
+	 */
+	public static function paid_status( $cod, $proposed ) {
+		return $cod ? 'completed' : $proposed;
+	}
+
+	/**
 	 * Llave de orden de los avisos: el más nuevo entre el pedido y su envío. Un aviso con una llave
 	 * menor o igual a la guardada es viejo (llegó tarde por un reintento) y no se aplica.
 	 *

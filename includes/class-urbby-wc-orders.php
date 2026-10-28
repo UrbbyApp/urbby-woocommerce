@@ -21,6 +21,7 @@ final class Urbby_WC_Orders {
 	const META_FULFILLMENT = '_urbby_fulfillment_id';
 	const META_NUMBER      = '_urbby_order_number';
 	const META_VERSION     = '_urbby_version';
+	const META_PAYMENT     = '_urbby_payment_method';
 	const ACTION_RECONCILE = 'urbby_wc_reconcile_orders';
 
 	/** Cancelar en la tienda → cancelar en Urbby. `QUEUED` mientras se avisa; `FROM` es el estado al que vuelve si Urbby no puede. */
@@ -45,6 +46,7 @@ final class Urbby_WC_Orders {
 	public static function hooks() {
 		add_action( 'rest_api_init', array( __CLASS__, 'routes' ) );
 		add_action( self::ACTION_RECONCILE, array( __CLASS__, 'reconcile' ) );
+		add_filter( 'woocommerce_payment_complete_order_status', array( __CLASS__, 'paid_status' ), 10, 3 );
 		add_action( 'woocommerce_order_status_changed', array( __CLASS__, 'on_status_changed' ), 10, 4 );
 		add_action( self::ACTION_CANCEL, array( __CLASS__, 'cancel_in_urbby' ), 10, 2 );
 	}
@@ -169,6 +171,7 @@ final class Urbby_WC_Orders {
 		$order->update_meta_data( self::META_FULFILLMENT, $f['id'] );
 		$order->update_meta_data( self::META_NUMBER, $f['orderNumber'] );
 		$order->update_meta_data( self::META_VERSION, Urbby_WC_Mapper::version( $f ) );
+		$order->update_meta_data( self::META_PAYMENT, Urbby_WC_Mapper::is_cod( $f ) ? 'cod' : 'prepaid' );
 
 		// Sin datos del comprador, a propósito: es cliente de Urbby, que coordina la entrega. Solo una
 		// referencia para reconocer la orden en la lista de Woo.
@@ -199,7 +202,7 @@ final class Urbby_WC_Orders {
 		}
 
 		$order->set_payment_method( 'urbby' );
-		$order->set_payment_method_title( 'cod' === ( isset( $f['paymentMethod'] ) ? $f['paymentMethod'] : '' ) ? __( 'Contra entrega (Urbby)', 'urbby-woocommerce' ) : 'Urbby' );
+		$order->set_payment_method_title( Urbby_WC_Mapper::is_cod( $f ) ? __( 'Contra entrega (Urbby)', 'urbby-woocommerce' ) : 'Urbby' );
 		$order->calculate_totals( false );
 		array_unshift(
 			$notes,
@@ -244,10 +247,29 @@ final class Urbby_WC_Orders {
 			/* translators: %s: estado del pedido en Urbby. */
 			$order->set_status( $status, sprintf( __( 'Urbby: %s.', 'urbby-woocommerce' ), self::status_label( $f ) ) );
 		}
-		// Entregado: el contra entrega se cobró al entregar. Woo no marca «pagada» una orden que nunca pasó por una pasarela.
+		// Entregado: el contra entrega se cobra al entregar, así que `date_paid` es la hora de la entrega.
+		// (Una orden prepagada ya la trae desde que se creó, y no se pisa.)
 		if ( 'completed' === $status && ! $order->get_date_paid() ) {
 			$order->set_date_paid( time() );
 		}
+	}
+
+	/**
+	 * Filtro `woocommerce_payment_complete_order_status`. Woo fija `date_paid` apenas la orden llega a
+	 * `processing`, y como el método de pago es `urbby` (no `cod`) la da por pagada al crearla. El contra
+	 * entrega se cobra al entregar: para esas órdenes «pagada» empieza en `completed`. Vale en cada
+	 * guardado, no solo al crear: un guardado posterior en `processing` tampoco la marca pagada.
+	 *
+	 * @param string        $status   Estado que propone Woo.
+	 * @param int           $order_id Orden.
+	 * @param WC_Order|null $order    Orden.
+	 * @return string
+	 */
+	public static function paid_status( $status, $order_id = 0, $order = null ) {
+		if ( ! $order instanceof WC_Order || 'cod' !== $order->get_meta( self::META_PAYMENT ) ) {
+			return $status;
+		}
+		return Urbby_WC_Mapper::paid_status( true, (string) $status );
 	}
 
 	/**
