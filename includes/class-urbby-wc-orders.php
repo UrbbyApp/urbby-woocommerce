@@ -5,6 +5,8 @@
  * La orden de Woo es un registro para que el comercio vea y despache todo desde un lugar: no cobra
  * (el cobro y la liquidación viven en Urbby), no descuenta stock (ya lo descontó Urbby al vender) y
  * va al precio de la compra, sin los descuentos de Urbby: las promociones de Urbby no tocan Woo.
+ * Tampoco trae datos del comprador (nombre, teléfono, dirección): Urbby los maneja y coordina la entrega.
+ * Lo único que va a la inversa es la cancelación: cancelarla en la tienda la cancela en Urbby.
  *
  * @package UrbbyWooCommerce
  */
@@ -21,12 +23,30 @@ final class Urbby_WC_Orders {
 	const META_VERSION     = '_urbby_version';
 	const ACTION_RECONCILE = 'urbby_wc_reconcile_orders';
 
+	/** Cancelar en la tienda → cancelar en Urbby. `QUEUED` mientras se avisa; `FROM` es el estado al que vuelve si Urbby no puede. */
+	const META_CANCEL_STATE = '_urbby_cancel_state';
+	const META_CANCEL_FROM  = '_urbby_cancel_from';
+	const ACTION_CANCEL     = 'urbby_wc_cancel_order';
+
+	/** Intentos de avisar la cancelación (con espera creciente) antes de devolver la orden a su estado. */
+	const CANCEL_ATTEMPTS = 6;
+
+	/**
+	 * Verdadero mientras ESTE plugin cambia la orden por lo que dijo Urbby (aviso, reconciliación) o la
+	 * devuelve a su estado: esos cambios no son de una persona y no se mandan de vuelta a Urbby.
+	 *
+	 * @var bool
+	 */
+	private static $applying = false;
+
 	/** Cuántas páginas de 50 mira la reconciliación: los pedidos de los últimos días. */
 	const RECONCILE_PAGES = 4;
 
 	public static function hooks() {
 		add_action( 'rest_api_init', array( __CLASS__, 'routes' ) );
 		add_action( self::ACTION_RECONCILE, array( __CLASS__, 'reconcile' ) );
+		add_action( 'woocommerce_order_status_changed', array( __CLASS__, 'on_status_changed' ), 10, 4 );
+		add_action( self::ACTION_CANCEL, array( __CLASS__, 'cancel_in_urbby' ), 10, 2 );
 	}
 
 	public static function routes() {
@@ -99,6 +119,7 @@ final class Urbby_WC_Orders {
 		if ( '1' !== (string) $wpdb->get_var( $wpdb->prepare( 'SELECT GET_LOCK(%s, 5)', $lock ) ) ) {
 			return 'busy';
 		}
+		self::$applying = true;
 		try {
 			$order = self::find( $f['id'] );
 			if ( ! $order ) {
@@ -114,6 +135,7 @@ final class Urbby_WC_Orders {
 			$order->save();
 			return 'updated';
 		} finally {
+			self::$applying = false;
 			$wpdb->query( $wpdb->prepare( 'SELECT RELEASE_LOCK(%s)', $lock ) );
 		}
 	}
@@ -148,20 +170,10 @@ final class Urbby_WC_Orders {
 		$order->update_meta_data( self::META_NUMBER, $f['orderNumber'] );
 		$order->update_meta_data( self::META_VERSION, Urbby_WC_Mapper::version( $f ) );
 
-		$address              = isset( $f['shippingAddress'] ) ? $f['shippingAddress'] : array();
-		list( $first, $last ) = Urbby_WC_Mapper::split_name( isset( $address['fullName'] ) ? $address['fullName'] : '' );
-		$fields               = array(
-			'first_name' => $first,
-			'last_name'  => $last,
-			'address_1'  => isset( $address['line1'] ) ? $address['line1'] : '',
-			'address_2'  => isset( $address['reference'] ) ? (string) $address['reference'] : '',
-			'city'       => isset( $address['city'] ) ? $address['city'] : '',
-			'state'      => isset( $address['department'] ) ? $address['department'] : '',
-			'country'    => 'SV',
-		);
-		// Sin correo del comprador, a propósito: es cliente de Urbby y Woo no le escribe.
-		$order->set_address( array_merge( $fields, array( 'phone' => isset( $address['phone'] ) ? $address['phone'] : '' ) ), 'billing' );
-		$order->set_address( $fields, 'shipping' );
+		// Sin datos del comprador, a propósito: es cliente de Urbby, que coordina la entrega. Solo una
+		// referencia para reconocer la orden en la lista de Woo.
+		$order->set_billing_first_name( 'Urbby' );
+		$order->set_billing_last_name( '#' . $f['orderNumber'] );
 
 		$map   = Urbby_WC_Stock::variant_map();
 		$notes = array();
@@ -181,17 +193,23 @@ final class Urbby_WC_Orders {
 			}
 			$order->add_item( $item );
 			if ( ! $woo ) {
-				$notes[] = 'Urbby: «' . $line['title'] . '» no está vinculado a un producto de esta tienda.';
+				/* translators: %s: nombre del producto en Urbby. */
+				$notes[] = sprintf( __( 'Urbby: «%s» no está vinculado a un producto de esta tienda.', 'urbby-woocommerce' ), $line['title'] );
 			}
 		}
 
 		$order->set_payment_method( 'urbby' );
-		$order->set_payment_method_title( 'Urbby' . ( 'cod' === ( isset( $f['paymentMethod'] ) ? $f['paymentMethod'] : '' ) ? ' (contra entrega)' : '' ) );
+		$order->set_payment_method_title( 'cod' === ( isset( $f['paymentMethod'] ) ? $f['paymentMethod'] : '' ) ? __( 'Contra entrega (Urbby)', 'urbby-woocommerce' ) : 'Urbby' );
 		$order->calculate_totals( false );
 		array_unshift(
 			$notes,
-			( $sandbox ? 'PRUEBA del Sandbox de Urbby. ' : '' ) . 'Pedido #' . $f['orderNumber'] . ' de Urbby. El cobro y el envío los maneja Urbby; el estado se actualiza solo.'
-			. ( ! empty( $f['couponCode'] ) ? ' El comprador usó el cupón ' . $f['couponCode'] . ' en Urbby: no cambia esta orden.' : '' )
+			( $sandbox ? __( 'PRUEBA del Sandbox de Urbby.', 'urbby-woocommerce' ) . ' ' : '' )
+			/* translators: %s: número de pedido de Urbby. */
+			. sprintf( __( 'Pedido #%s de Urbby. El cobro, la entrega y los datos del comprador los maneja Urbby; el estado se actualiza solo.', 'urbby-woocommerce' ), $f['orderNumber'] )
+			. ( ! empty( $f['couponCode'] )
+				/* translators: %s: código del cupón. */
+				? ' ' . sprintf( __( 'El comprador usó el cupón %s en Urbby: no cambia esta orden.', 'urbby-woocommerce' ), $f['couponCode'] )
+				: '' )
 		);
 		self::apply_status( $order, $f );
 		$order->save();
@@ -223,8 +241,28 @@ final class Urbby_WC_Orders {
 	private static function apply_status( WC_Order $order, array $f ) {
 		$status = Urbby_WC_Mapper::woo_status( $f );
 		if ( $order->get_status() !== $status ) {
-			$order->set_status( $status, 'Urbby: ' . self::status_label( $f ) . '.' );
+			/* translators: %s: estado del pedido en Urbby. */
+			$order->set_status( $status, sprintf( __( 'Urbby: %s.', 'urbby-woocommerce' ), self::status_label( $f ) ) );
 		}
+		// Entregado: el contra entrega se cobró al entregar. Woo no marca «pagada» una orden que nunca pasó por una pasarela.
+		if ( 'completed' === $status && ! $order->get_date_paid() ) {
+			$order->set_date_paid( time() );
+		}
+	}
+
+	/**
+	 * @param string $status Estado de un pedido de Urbby.
+	 * @return string
+	 */
+	public static function status_text( $status ) {
+		$labels = array(
+			'nuevo'             => __( 'pedido nuevo', 'urbby-woocommerce' ),
+			'preparando'        => __( 'en preparación', 'urbby-woocommerce' ),
+			'listo_recoleccion' => __( 'listo para que lo recojan', 'urbby-woocommerce' ),
+			'recogido'          => __( 'recogido por el transportista', 'urbby-woocommerce' ),
+			'cancelado'         => __( 'cancelado', 'urbby-woocommerce' ),
+		);
+		return isset( $labels[ $status ] ) ? $labels[ $status ] : (string) $status;
 	}
 
 	/**
@@ -232,18 +270,134 @@ final class Urbby_WC_Orders {
 	 * @return string
 	 */
 	private static function status_label( array $f ) {
-		$labels = array(
-			'nuevo'             => 'pedido nuevo',
-			'preparando'        => 'en preparación',
-			'listo_recoleccion' => 'listo para que lo recojan',
-			'recogido'          => 'recogido por el transportista',
-			'cancelado'         => 'cancelado',
-		);
-		$label  = isset( $labels[ $f['status'] ] ) ? $labels[ $f['status'] ] : $f['status'];
+		$label = self::status_text( $f['status'] );
 		if ( ! empty( $f['shipment']['status'] ) ) {
-			$label .= ' (envío: ' . $f['shipment']['status'] . ')';
+			/* translators: 1: estado del pedido, 2: estado del envío. */
+			$label = sprintf( __( '%1$s (envío: %2$s)', 'urbby-woocommerce' ), $label, $f['shipment']['status'] );
 		}
 		return $label;
+	}
+
+	// ─────────────────────────────────────────────────────────── cancelar en la tienda = cancelar en Urbby
+
+	/**
+	 * Una persona canceló en Woo una orden que vino de Urbby: se avisa a Urbby en segundo plano. Lo que
+	 * cambia este plugin por lo que dijo Urbby (`$applying`) no entra: ahí no hay nadie que avisar y
+	 * volvería a Urbby lo que Urbby acaba de decir.
+	 *
+	 * @param int      $order_id Orden.
+	 * @param string   $from     Estado anterior (sin `wc-`).
+	 * @param string   $to       Estado nuevo.
+	 * @param WC_Order $order    Orden.
+	 */
+	public static function on_status_changed( $order_id, $from, $to, $order ) {
+		if ( self::$applying || 'cancelled' !== $to || ! $order instanceof WC_Order || ! $order->get_meta( self::META_FULFILLMENT ) || 'queued' === $order->get_meta( self::META_CANCEL_STATE ) ) {
+			return;
+		}
+		$order->update_meta_data( self::META_CANCEL_STATE, 'queued' );
+		$order->update_meta_data( self::META_CANCEL_FROM, (string) $from );
+		$order->save_meta_data();
+		Urbby_WC_Stock::later( self::ACTION_CANCEL, array( (int) $order_id, 0 ), 1 );
+	}
+
+	/**
+	 * `POST /public/orders/{id}/cancel`. Cancelada (o ya lo estaba): nota. Sin respuesta o error de
+	 * Urbby: se reintenta con espera creciente. Urbby no puede (ya está lista para recoger, sin
+	 * permiso…): la orden vuelve a su estado anterior con el motivo. Así Woo no se queda «cancelada»
+	 * mientras Urbby sigue adelante con el envío. Idempotente: Urbby contesta 200 si ya estaba cancelada.
+	 *
+	 * @param int $order_id Orden de Woo.
+	 * @param int $attempt  Intento (0 el primero).
+	 */
+	public static function cancel_in_urbby( $order_id, $attempt = 0 ) {
+		$order = wc_get_order( $order_id );
+		if ( ! $order || 'queued' !== $order->get_meta( self::META_CANCEL_STATE ) ) {
+			return;
+		}
+		if ( 'cancelled' !== $order->get_status() ) {
+			// La reabrieron antes de que corriera: no hay nada que cancelar.
+			$order->delete_meta_data( self::META_CANCEL_STATE );
+			$order->delete_meta_data( self::META_CANCEL_FROM );
+			$order->save_meta_data();
+			return;
+		}
+		if ( ! Urbby_WC_Settings::connected() ) {
+			self::restore( $order, __( 'este sitio no está conectado con Urbby.', 'urbby-woocommerce' ) );
+			return;
+		}
+		$res = Urbby_WC_Api::cancel_order( (string) $order->get_meta( self::META_FULFILLMENT ) );
+		$out = Urbby_WC_Mapper::cancel_outcome( $res );
+		if ( 'done' === $out ) {
+			$order->delete_meta_data( self::META_CANCEL_STATE );
+			$order->delete_meta_data( self::META_CANCEL_FROM );
+			$order->save_meta_data();
+			$order->add_order_note( __( 'Urbby: el pedido también quedó cancelado en Urbby.', 'urbby-woocommerce' ) );
+			return;
+		}
+		Urbby_WC_Log::error(
+			'No se pudo cancelar el pedido en Urbby.',
+			array(
+				'order'   => (int) $order_id,
+				'attempt' => (int) $attempt,
+				'status'  => $res->status,
+				'code'    => $res->code(),
+			)
+		);
+		if ( 'retry' === $out && (int) $attempt + 1 < self::CANCEL_ATTEMPTS ) {
+			Urbby_WC_Stock::later( self::ACTION_CANCEL, array( (int) $order_id, (int) $attempt + 1 ), Urbby_WC_Stock::backoff( (int) $attempt + 1 ) );
+			return;
+		}
+		self::restore( $order, 'retry' === $out ? __( 'Urbby no respondió después de varios intentos.', 'urbby-woocommerce' ) : self::cancel_refusal( $res ) );
+	}
+
+	/**
+	 * @param Urbby_WC_Response $res Respuesta de Urbby que no es un éxito ni se reintenta.
+	 * @return string El motivo, para la nota de la orden.
+	 */
+	private static function cancel_refusal( Urbby_WC_Response $res ) {
+		if ( 'FULFILLMENT_INVALID_TRANSITION' === $res->code() ) {
+			return sprintf(
+				/* translators: %s: estado actual del pedido en Urbby. */
+				__( 'el pedido ya está «%s» en Urbby y desde la tienda no se puede cancelar. Si hay que cancelarlo, hablalo con Urbby.', 'urbby-woocommerce' ),
+				self::status_text( isset( $res->body['details']['status'] ) ? (string) $res->body['details']['status'] : '' )
+			);
+		}
+		if ( 404 === $res->status ) {
+			return __( 'Urbby no encontró este pedido.', 'urbby-woocommerce' );
+		}
+		if ( 401 === $res->status || 403 === $res->status ) {
+			return __( 'la credencial no tiene permiso para cancelar pedidos (orders:write). Tocá «Conectar con Urbby» en WooCommerce → Urbby para crear una con todos los permisos.', 'urbby-woocommerce' );
+		}
+		return wp_strip_all_tags( $res->message() );
+	}
+
+	/**
+	 * Devuelve la orden al estado que tenía antes de que la cancelaran y deja el motivo en una nota.
+	 *
+	 * @param WC_Order $order  Orden.
+	 * @param string   $reason Por qué Urbby no la canceló.
+	 */
+	private static function restore( WC_Order $order, $reason ) {
+		$previous = (string) $order->get_meta( self::META_CANCEL_FROM );
+		if ( '' === $previous || ! isset( wc_get_order_statuses()[ 'wc-' . $previous ] ) ) {
+			$previous = 'processing';
+		}
+		$order->delete_meta_data( self::META_CANCEL_STATE );
+		$order->delete_meta_data( self::META_CANCEL_FROM );
+		self::$applying = true;
+		try {
+			$order->update_status(
+				$previous,
+				sprintf(
+					/* translators: 1: motivo, 2: estado al que vuelve la orden. */
+					__( 'Urbby no canceló este pedido: %1$s. Se devolvió la orden a «%2$s».', 'urbby-woocommerce' ),
+					rtrim( $reason, '. ' ),
+					wc_get_order_status_name( $previous )
+				)
+			);
+		} finally {
+			self::$applying = false;
+		}
 	}
 
 	/**

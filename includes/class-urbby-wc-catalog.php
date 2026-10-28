@@ -152,14 +152,14 @@ final class Urbby_WC_Catalog {
 			}
 			$product = $entry['product'];
 			if ( 'failed' === $row['status'] ) {
-				update_post_meta( $product->get_id(), self::META_ERROR, isset( $row['error']['message'] ) ? $row['error']['message'] : 'Urbby rechazó este producto.' );
+				update_post_meta( $product->get_id(), self::META_ERROR, isset( $row['error']['message'] ) ? $row['error']['message'] : __( 'Urbby rechazó este producto.', 'urbby-woocommerce' ) );
 				continue;
 			}
 			update_post_meta( $product->get_id(), self::META_PRODUCT, $row['productId'] );
 			update_post_meta( $product->get_id(), self::META_IMAGES, $entry['images_hash'] );
 			delete_post_meta( $product->get_id(), self::META_ERROR );
 			if ( ! self::link_variants( $product, $row['productId'] ) ) {
-				update_post_meta( $product->get_id(), self::META_ERROR, 'Falta terminar de vincularlo con Urbby. Se reintenta solo.' );
+				update_post_meta( $product->get_id(), self::META_ERROR, __( 'Falta terminar de vincularlo con Urbby. Se reintenta solo.', 'urbby-woocommerce' ) );
 				Urbby_WC_Stock::later( self::ACTION_PUSH, array( array( $product->get_id() ) ), 300 );
 			}
 		}
@@ -357,7 +357,7 @@ final class Urbby_WC_Catalog {
 		$id = $product->get_id();
 
 		if ( ! $product->is_type( 'simple' ) && ! $product->is_type( 'variable' ) ) {
-			return new WP_Error( 'unsupported', 'Urbby recibe productos simples y variables.' );
+			return new WP_Error( 'unsupported', __( 'Urbby recibe productos simples y variables.', 'urbby-woocommerce' ) );
 		}
 		$mapped = (bool) get_post_meta( $id, self::META_PRODUCT, true );
 		if ( $mapped ) {
@@ -380,15 +380,15 @@ final class Urbby_WC_Catalog {
 
 		$title = Urbby_WC_Mapper::plain_text( $product->get_name(), 120 );
 		if ( mb_strlen( $title ) < 8 ) {
-			return new WP_Error( 'title', 'El nombre necesita al menos 8 caracteres para Urbby.' );
+			return new WP_Error( 'title', __( 'El nombre necesita al menos 8 caracteres para Urbby.', 'urbby-woocommerce' ) );
 		}
 		$description = Urbby_WC_Mapper::plain_text( $product->get_description() ? $product->get_description() : $product->get_short_description(), 2000 );
 		if ( mb_strlen( $description ) < 20 ) {
-			return new WP_Error( 'description', 'La descripción necesita al menos 20 caracteres para Urbby.' );
+			return new WP_Error( 'description', __( 'La descripción necesita al menos 20 caracteres para Urbby.', 'urbby-woocommerce' ) );
 		}
 		$category = Urbby_WC_Settings::urbby_category_for( $product->get_category_ids() );
 		if ( '' === $category ) {
-			return new WP_Error( 'category', 'Elegí a qué categoría de Urbby va (WooCommerce → Urbby → Categorías).' );
+			return new WP_Error( 'category', __( 'Elegí a qué categoría de Urbby va (WooCommerce → Urbby → Categorías).', 'urbby-woocommerce' ) );
 		}
 
 		$item = array(
@@ -428,7 +428,7 @@ final class Urbby_WC_Catalog {
 			return $prices;
 		}
 		if ( true !== $product->get_manage_stock() ) {
-			return new WP_Error( 'stock', 'Activá «Gestionar inventario» en este producto: Urbby necesita la cantidad.' );
+			return new WP_Error( 'stock', __( 'Activá «Gestionar inventario» en este producto: Urbby necesita la cantidad.', 'urbby-woocommerce' ) );
 		}
 		// Solo cuando llega a Urbby por primera vez: es la migración del stock de Woo. Después manda Urbby.
 		if ( ! $mapped ) {
@@ -448,7 +448,7 @@ final class Urbby_WC_Catalog {
 	private static function build_variable( WC_Product $product ) {
 		$attributes = self::variation_attributes( $product );
 		if ( count( $attributes ) > self::MAX_OPTIONS ) {
-			return new WP_Error( 'options', 'Urbby admite hasta 3 atributos que armen variaciones.' );
+			return new WP_Error( 'options', __( 'Urbby admite hasta 3 atributos que armen variaciones.', 'urbby-woocommerce' ) );
 		}
 		$options = array();
 		foreach ( $attributes as $attribute ) {
@@ -466,10 +466,10 @@ final class Urbby_WC_Catalog {
 		foreach ( self::active_variations( $product ) as $variation ) {
 			$values = self::variation_values( $product, $variation );
 			if ( in_array( '', $values, true ) ) {
-				return new WP_Error( 'any', 'Una variación acepta «cualquier» valor de un atributo: Urbby necesita cada combinación por separado.' );
+				return new WP_Error( 'any', __( 'Una variación acepta «cualquier» valor de un atributo: Urbby necesita cada combinación por separado.', 'urbby-woocommerce' ) );
 			}
 			if ( true !== $variation->get_manage_stock() ) {
-				return new WP_Error( 'stock', 'Activá «Gestionar inventario» en cada variación (no en el producto): Urbby lleva el stock por variación.' );
+				return new WP_Error( 'stock', __( 'Activá «Gestionar inventario» en cada variación (no en el producto): Urbby lleva el stock por variación.', 'urbby-woocommerce' ) );
 			}
 			$prices = self::prices( $variation );
 			if ( is_wp_error( $prices ) ) {
@@ -500,10 +500,10 @@ final class Urbby_WC_Catalog {
 			}
 		}
 		if ( ! $variants ) {
-			return new WP_Error( 'variants', 'Este producto no tiene variaciones activas.' );
+			return new WP_Error( 'variants', __( 'Este producto no tiene variaciones activas.', 'urbby-woocommerce' ) );
 		}
 		if ( count( $variants ) > self::MAX_VARIANTS ) {
-			return new WP_Error( 'variants', 'Urbby admite hasta 12 variaciones por producto.' );
+			return new WP_Error( 'variants', __( 'Urbby admite hasta 12 variaciones por producto.', 'urbby-woocommerce' ) );
 		}
 		return array(
 			'price'    => $min_price,
@@ -521,7 +521,7 @@ final class Urbby_WC_Catalog {
 	private static function prices( WC_Product $product ) {
 		$price = Urbby_WC_Mapper::money( $product->get_price() );
 		if ( null === $price ) {
-			return new WP_Error( 'price', 'Ponele precio: Urbby no publica productos sin precio.' );
+			return new WP_Error( 'price', __( 'Ponele precio: Urbby no publica productos sin precio.', 'urbby-woocommerce' ) );
 		}
 		$regular = Urbby_WC_Mapper::money( $product->get_regular_price() );
 		$before  = null;

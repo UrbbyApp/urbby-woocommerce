@@ -2,6 +2,7 @@
 <ruleset name="urbby-woocommerce">
   <description>WordPress Coding Standards + compatibilidad con PHP 7.4.</description>
   <file>urbby-woocommerce.php</file>
+  <file>uninstall.php</file>
   <file>includes</file>
   <arg name="extensions" value="php"/>
   <arg value="sp"/>

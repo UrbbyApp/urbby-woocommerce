@@ -112,9 +112,7 @@ final class MapperTest extends TestCase {
 		$this->assertSame( array( 'variantId' => 'v', 'mode' => 'sale', 'amount' => 3 ), Urbby_WC_Mapper::stock_delta_row( 'v', -3 ) );
 	}
 
-	public function test_nombre_y_texto() {
-		$this->assertSame( array( 'Ana María', 'López' ), Urbby_WC_Mapper::split_name( '  Ana María   López ' ) );
-		$this->assertSame( array( 'Cher', '' ), Urbby_WC_Mapper::split_name( 'Cher' ) );
+	public function test_texto_plano() {
 		$this->assertSame( "Hola & chau\nlínea", Urbby_WC_Mapper::plain_text( '<p>Hola &amp; <b>chau</b></p>línea', 2000 ) );
 		$this->assertSame( 'abc', Urbby_WC_Mapper::plain_text( 'abcdef', 3 ) );
 	}
@@ -123,5 +121,63 @@ final class MapperTest extends TestCase {
 		$this->assertSame( Urbby_WC_Mapper::option_key( array( 'M', ' Rojo ' ) ), Urbby_WC_Mapper::option_key( array( 'm', 'rojo', null ) ) );
 		$this->assertNotSame( Urbby_WC_Mapper::option_key( array( 'M', 'Rojo' ) ), Urbby_WC_Mapper::option_key( array( 'Rojo', 'M' ) ) );
 		$this->assertSame( Urbby_WC_Mapper::option_key( array( 'Único' ) ), Urbby_WC_Mapper::option_key( array( 'único' ) ) );
+	}
+
+	public function test_pkce_s256_coincide_con_el_vector_de_la_rfc_7636() {
+		// Apéndice B de la RFC 7636.
+		$this->assertSame( 'E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM', Urbby_WC_Mapper::pkce_challenge( 'dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk' ) );
+	}
+
+	public function test_el_verifier_es_unico_y_cumple_el_contrato() {
+		$a = Urbby_WC_Mapper::new_verifier();
+		$this->assertMatchesRegularExpression( '/^[A-Za-z0-9._~-]{43,128}$/', $a );
+		$this->assertNotSame( $a, Urbby_WC_Mapper::new_verifier() );
+		$this->assertMatchesRegularExpression( '/^[A-Za-z0-9_-]{43}$/', Urbby_WC_Mapper::pkce_challenge( $a ) );
+	}
+
+	public function test_la_url_de_autorizacion_lleva_los_cinco_parametros_codificados() {
+		$url = Urbby_WC_Mapper::authorize_url( 'https://comercios.urbby.app/', 'https://tienda.test/wp-admin/admin.php?page=urbby-woocommerce', 'st_1', 'chal' );
+		$this->assertStringStartsWith( 'https://comercios.urbby.app/integraciones/autorizar?', $url );
+		parse_str( (string) parse_url( $url, PHP_URL_QUERY ), $q );
+		$this->assertSame(
+			array(
+				'app'                   => 'woocommerce',
+				'redirect_uri'          => 'https://tienda.test/wp-admin/admin.php?page=urbby-woocommerce',
+				'state'                 => 'st_1',
+				'code_challenge'        => 'chal',
+				'code_challenge_method' => 'S256',
+			),
+			$q
+		);
+		// El `?` y el `&` del redirect_uri viajan codificados: no parten el query del portal.
+		$this->assertStringContainsString( 'redirect_uri=https%3A%2F%2Ftienda.test%2Fwp-admin%2Fadmin.php%3Fpage%3Durbby-woocommerce&', $url );
+	}
+
+	public function test_la_conexion_pide_https_y_el_mismo_host() {
+		$admin = 'https://tienda.test/wp-admin/admin.php?page=urbby-woocommerce';
+		$this->assertSame( '', Urbby_WC_Mapper::connect_problem( $admin, 'https://TIENDA.test/wp-json/urbby/v1/webhook' ) );
+		$this->assertSame( '', Urbby_WC_Mapper::connect_problem( 'http://localhost/wp-admin/admin.php', 'http://localhost/wp-json/urbby/v1/webhook' ) );
+		$this->assertSame( 'https', Urbby_WC_Mapper::connect_problem( 'http://tienda.test/wp-admin/admin.php', 'http://tienda.test/wp-json/urbby/v1/webhook' ) );
+		$this->assertSame( 'https', Urbby_WC_Mapper::connect_problem( $admin, 'http://tienda.test/wp-json/urbby/v1/webhook' ) );
+		$this->assertSame( 'https', Urbby_WC_Mapper::connect_problem( 'https://user:pw@tienda.test/wp-admin/', 'https://tienda.test/x' ) );
+		$this->assertSame( 'host', Urbby_WC_Mapper::connect_problem( $admin, 'https://api.tienda.test/wp-json/urbby/v1/webhook' ) );
+	}
+
+	public function test_cancelar_en_urbby_se_reintenta_solo_si_puede_cambiar_la_respuesta() {
+		$casos = array(
+			'cancelada'         => array( 200, array( 'id' => 'f1', 'status' => 'cancelado' ), 'done' ),
+			'sin respuesta'     => array( 0, null, 'retry' ),
+			'error de Urbby'    => array( 503, array( 'code' => 'X' ), 'retry' ),
+			'límite'            => array( 429, array( 'code' => 'RATE_LIMITED' ), 'retry' ),
+			'un proxy (200 html)' => array( 200, null, 'retry' ),
+			'cambió en el medio' => array( 409, array( 'code' => 'FULFILLMENT_STATUS_CHANGED' ), 'retry' ),
+			'ya no se puede'    => array( 409, array( 'code' => 'FULFILLMENT_INVALID_TRANSITION', 'details' => array( 'status' => 'listo_recoleccion' ) ), 'restore' ),
+			'no existe'         => array( 404, array( 'code' => 'NOT_FOUND' ), 'restore' ),
+			'sin permiso'       => array( 403, array( 'code' => 'FORBIDDEN' ), 'restore' ),
+			'credencial'        => array( 401, array( 'code' => 'UNAUTHORIZED' ), 'restore' ),
+		);
+		foreach ( $casos as $nombre => $c ) {
+			$this->assertSame( $c[2], Urbby_WC_Mapper::cancel_outcome( new Urbby_WC_Response( $c[0], $c[1] ) ), $nombre );
+		}
 	}
 }
