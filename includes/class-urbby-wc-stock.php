@@ -123,7 +123,7 @@ final class Urbby_WC_Stock {
 	 * @param int $attempt Intento (0 el primero).
 	 * @return int Segundos.
 	 */
-	private static function backoff( $attempt ) {
+	public static function backoff( $attempt ) {
 		return min( 900, 60 * ( 2 ** min( 4, max( 0, (int) $attempt ) ) ) );
 	}
 
@@ -137,6 +137,9 @@ final class Urbby_WC_Stock {
 	 */
 	public static function urbby_lines( WC_Order $order ) {
 		$lines = array();
+		if ( ! Urbby_WC_Settings::sells_via_urbby() ) {
+			return $lines;
+		}
 		foreach ( $order->get_items() as $item ) {
 			$variant = self::variant_of_item( $item );
 			if ( $variant ) {
@@ -212,14 +215,20 @@ final class Urbby_WC_Stock {
 	 */
 	public static function checkout_message( Urbby_WC_Response $res ) {
 		if ( 'STOCK_INSUFFICIENT' !== $res->code() ) {
-			return 'No pudimos confirmar el stock de tu pedido. Probá de nuevo en un momento.';
+			return __( 'No pudimos confirmar el stock de tu pedido. Probá de nuevo en un momento.', 'urbby-woocommerce' );
 		}
 		$names = array();
 		foreach ( (array) $res->body['details']['lines'] as $short ) {
 			$product = self::product_for_variant( $short['variantId'] );
-			$names[] = ( $product ? $product->get_name() : 'un producto' ) . ' (quedan ' . (int) $short['available'] . ')';
+			$names[] = sprintf(
+				/* translators: 1: nombre del producto, 2: unidades que quedan. */
+				__( '%1$s (quedan %2$d)', 'urbby-woocommerce' ),
+				$product ? $product->get_name() : __( 'un producto', 'urbby-woocommerce' ),
+				(int) $short['available']
+			);
 		}
-		return 'No hay stock suficiente de: ' . implode( ', ', $names ) . '.';
+		/* translators: %s: lista de productos con lo que queda de cada uno. */
+		return sprintf( __( 'No hay stock suficiente de: %s.', 'urbby-woocommerce' ), implode( ', ', $names ) );
 	}
 
 	/**
@@ -234,7 +243,8 @@ final class Urbby_WC_Stock {
 			return;
 		}
 		$message = self::checkout_message( $result );
-		$order->update_status( 'failed', 'Urbby: ' . $message );
+		/* translators: %s: motivo. */
+		$order->update_status( 'failed', sprintf( __( 'Urbby: %s', 'urbby-woocommerce' ), $message ) );
 		throw new Exception( esc_html( $message ) );
 	}
 
@@ -342,7 +352,14 @@ final class Urbby_WC_Stock {
 			$reserved = self::reserve( $order );
 			if ( true !== $reserved ) {
 				if ( 'STOCK_INSUFFICIENT' === $reserved->code() ) {
-					$order->update_status( 'on-hold', 'Urbby no tiene stock para esta venta: ' . self::checkout_message( $reserved ) . ' No la despaches sin revisar.' );
+					$order->update_status(
+						'on-hold',
+						sprintf(
+							/* translators: %s: detalle de lo que falta. */
+							__( 'Urbby no tiene stock para esta venta: %s No la despaches sin revisar.', 'urbby-woocommerce' ),
+							self::checkout_message( $reserved )
+						)
+					);
 					return;
 				}
 				self::fail( self::ACTION_SETTLE, $order, $reserved, 'no se pudo apartar el stock en Urbby' );
@@ -359,7 +376,7 @@ final class Urbby_WC_Stock {
 		$order->update_meta_data( self::ORDER_STATE, 'confirmed' );
 		$order->delete_meta_data( self::ORDER_RETRIES );
 		$order->save();
-		$order->add_order_note( 'Urbby: stock confirmado.' );
+		$order->add_order_note( __( 'Urbby: stock confirmado.', 'urbby-woocommerce' ) );
 	}
 
 	/**
@@ -407,7 +424,7 @@ final class Urbby_WC_Stock {
 		$order->update_meta_data( self::ORDER_STATE, 'released' );
 		$order->delete_meta_data( self::ORDER_RETRIES );
 		$order->save();
-		$order->add_order_note( 'Urbby: stock devuelto.' );
+		$order->add_order_note( __( 'Urbby: stock devuelto.', 'urbby-woocommerce' ) );
 		self::display_from_reservation( $res->body );
 	}
 
@@ -461,7 +478,14 @@ final class Urbby_WC_Stock {
 			)
 		);
 		if ( ! $res->retryable() ) {
-			$order->add_order_note( 'Urbby: ' . $why . ' (' . $res->message() . '). Revisalo antes de despachar.' );
+			$order->add_order_note(
+				sprintf(
+					/* translators: 1: qué se intentaba, 2: respuesta de Urbby. */
+					__( 'Urbby: %1$s (%2$s). Revisalo antes de despachar.', 'urbby-woocommerce' ),
+					$why,
+					$res->message()
+				)
+			);
 			if ( self::ACTION_SETTLE === $action && 'on-hold' !== $order->get_status() ) {
 				$order->update_status( 'on-hold' );
 			}
@@ -471,7 +495,14 @@ final class Urbby_WC_Stock {
 		$order->update_meta_data( self::ORDER_RETRIES, $attempt + 1 );
 		$order->save();
 		if ( 0 === $attempt ) {
-			$order->add_order_note( 'Urbby: ' . $why . ' (' . $res->message() . '). Se reintenta solo.' );
+			$order->add_order_note(
+				sprintf(
+					/* translators: 1: qué se intentaba, 2: respuesta de Urbby. */
+					__( 'Urbby: %1$s (%2$s). Se reintenta solo.', 'urbby-woocommerce' ),
+					$why,
+					$res->message()
+				)
+			);
 		}
 		self::later( $action, array( $order->get_id() ), self::backoff( $attempt ) );
 	}
@@ -486,7 +517,7 @@ final class Urbby_WC_Stock {
 	 * @param WC_Product $product Producto o variación.
 	 */
 	public static function on_stock_set( $product ) {
-		if ( self::$writing || ! $product instanceof WC_Product || true !== $product->get_manage_stock() || ! get_post_meta( $product->get_id(), Urbby_WC_Catalog::META_VARIANT, true ) ) {
+		if ( self::$writing || ! Urbby_WC_Settings::sells_via_urbby() || ! $product instanceof WC_Product || true !== $product->get_manage_stock() || ! get_post_meta( $product->get_id(), Urbby_WC_Catalog::META_VARIANT, true ) ) {
 			return;
 		}
 		if ( '' === (string) get_post_meta( $product->get_id(), self::META_SYNCED, true ) ) {
@@ -536,7 +567,15 @@ final class Urbby_WC_Stock {
 					update_post_meta( $product_id, self::META_INFLIGHT, 'yes' );
 					self::later( self::ACTION_DELTA, array( (int) $product_id ), 120 );
 				} else {
-					update_post_meta( $product_id, Urbby_WC_Catalog::META_ERROR, 'Urbby no aceptó el cambio de stock: ' . $res->message() );
+					update_post_meta(
+						$product_id,
+						Urbby_WC_Catalog::META_ERROR,
+						sprintf(
+							/* translators: %s: motivo. */
+							__( 'Urbby no aceptó el cambio de stock: %s', 'urbby-woocommerce' ),
+							$res->message()
+						)
+					);
 					self::done_delta( $product_id );
 				}
 				return;
@@ -550,7 +589,15 @@ final class Urbby_WC_Stock {
 			$code    = isset( $row['error']['code'] ) ? $row['error']['code'] : '';
 			$current = isset( $row['error']['details']['currentStock'] ) ? (int) $row['error']['details']['currentStock'] : null;
 			if ( 'STOCK_CHANGED' !== $code || null === $current ) {
-				update_post_meta( $product_id, Urbby_WC_Catalog::META_ERROR, 'Urbby no aceptó el cambio de stock: ' . ( isset( $row['error']['message'] ) ? $row['error']['message'] : 'error' ) );
+				update_post_meta(
+					$product_id,
+					Urbby_WC_Catalog::META_ERROR,
+					sprintf(
+						/* translators: %s: motivo. */
+						__( 'Urbby no aceptó el cambio de stock: %s', 'urbby-woocommerce' ),
+						isset( $row['error']['message'] ) ? $row['error']['message'] : 'error'
+					)
+				);
 				self::done_delta( $product_id );
 				return;
 			}
@@ -562,7 +609,16 @@ final class Urbby_WC_Stock {
 			}
 			if ( get_post_meta( $product_id, self::META_INFLIGHT, true ) ) {
 				// Hubo un intento sin respuesta y Urbby además se movió: no hay forma de saber si aquel llegó.
-				update_post_meta( $product_id, Urbby_WC_Catalog::META_ERROR, 'No sabemos si Urbby recibió tu último cambio de stock (de ' . $expected . ' a ' . $target . '). Revisá el stock de este producto en Urbby.' );
+				update_post_meta(
+					$product_id,
+					Urbby_WC_Catalog::META_ERROR,
+					sprintf(
+						/* translators: 1: stock anterior, 2: stock nuevo. */
+						__( 'No sabemos si Urbby recibió tu último cambio de stock (de %1$s a %2$s). Revisá el stock de este producto en Urbby.', 'urbby-woocommerce' ),
+						$expected,
+						$target
+					)
+				);
 				self::write_display( $product, $current );
 				self::done_delta( $product_id );
 				return;

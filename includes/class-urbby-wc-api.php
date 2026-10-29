@@ -22,7 +22,7 @@ final class Urbby_WC_Api {
 	 */
 	public static function request( $method, $path, $body = null, $timeout = 15 ) {
 		if ( Urbby_WC_Settings::moved() ) {
-			return new Urbby_WC_Response( 0, null, 'este sitio no es el que se conectó; guardá la conexión de nuevo' );
+			return new Urbby_WC_Response( 0, null, __( 'este sitio no es el que se conectó; conectalo de nuevo', 'urbby-woocommerce' ) );
 		}
 		$s    = Urbby_WC_Settings::get();
 		$args = array(
@@ -37,18 +37,69 @@ final class Urbby_WC_Api {
 			),
 		);
 		// El API exige JSON en todo POST/PATCH, aunque no lleve datos (si no, 415).
-		if ( null === $body && 'GET' !== $method ) {
+		if ( null === $body && in_array( $method, array( 'POST', 'PUT', 'PATCH' ), true ) ) {
 			$body = new stdClass();
 		}
 		if ( null !== $body ) {
 			$args['headers']['Content-Type'] = 'application/json';
 			$args['body']                    = wp_json_encode( $body );
 		}
-		$res = wp_remote_request( Urbby_WC_Settings::api_base() . $path, $args );
+		$res = self::to_response( wp_remote_request( Urbby_WC_Settings::api_base() . $path, $args ) );
+		// Un 401 es la credencial revocada (p. ej. «Desconectar» en el portal): la pantalla del plugin lo dice.
+		if ( 401 === $res->status && '' !== $s['client_id'] && ! $s['auth_failed'] ) {
+			Urbby_WC_Settings::update( array( 'auth_failed' => time() ) );
+		} elseif ( $res->status >= 200 && $res->status < 300 && $s['auth_failed'] ) {
+			Urbby_WC_Settings::update( array( 'auth_failed' => 0 ) );
+		}
+		return $res;
+	}
+
+	/**
+	 * @param array|WP_Error $res Lo que devolvió `wp_remote_request`.
+	 * @return Urbby_WC_Response
+	 */
+	private static function to_response( $res ) {
 		if ( is_wp_error( $res ) ) {
 			return new Urbby_WC_Response( 0, null, $res->get_error_message() );
 		}
 		return new Urbby_WC_Response( wp_remote_retrieve_response_code( $res ), json_decode( wp_remote_retrieve_body( $res ), true ) );
+	}
+
+	/**
+	 * Canjea el código de «Conectar con Urbby» por la credencial y el webhook. Sin Basic: el plugin es un
+	 * cliente público (no guarda un secreto de app) y lo que prueba quién canjea es el `codeVerifier` de PKCE.
+	 * Aparte de `request()`: todavía no hay credencial, y este sitio puede figurar como «movido».
+	 *
+	 * @param array $body `code`, `codeVerifier`, `redirectUri`, `clientId`, `webhookUrl`.
+	 * @return Urbby_WC_Response
+	 */
+	public static function exchange_code( array $body ) {
+		return self::to_response(
+			wp_remote_post(
+				Urbby_WC_Settings::api_base() . '/public/integrations/token',
+				array(
+					'timeout'     => 20,
+					'redirection' => 0,
+					'headers'     => array(
+						'Accept'       => 'application/json',
+						'Content-Type' => 'application/json',
+						'User-Agent'   => 'urbby-woocommerce/' . URBBY_WC_VERSION,
+					),
+					'body'        => wp_json_encode( $body ),
+				)
+			)
+		);
+	}
+
+	/**
+	 * La credencial se revoca a sí misma (desconectar). En la conexión «Conectar con Urbby» Urbby además
+	 * pasa a borrador los productos `woo-*` y borra el webhook.
+	 *
+	 * @param int $timeout Segundos: se llama al desactivar o desinstalar, que no puede quedar esperando.
+	 * @return Urbby_WC_Response
+	 */
+	public static function revoke_credential( $timeout = 8 ) {
+		return self::request( 'DELETE', '/public/integrations/credential', null, $timeout );
 	}
 
 	/** @return Urbby_WC_Response */
@@ -139,5 +190,15 @@ final class Urbby_WC_Api {
 	 */
 	public static function order( $fulfillment_id ) {
 		return self::request( 'GET', '/public/orders/' . rawurlencode( $fulfillment_id ) );
+	}
+
+	/**
+	 * Cancela en Urbby el pedido que se canceló en la tienda. Idempotente: si ya estaba cancelado, 200.
+	 *
+	 * @param string $fulfillment_id Pedido.
+	 * @return Urbby_WC_Response
+	 */
+	public static function cancel_order( $fulfillment_id ) {
+		return self::request( 'POST', '/public/orders/' . rawurlencode( $fulfillment_id ) . '/cancel', null, 15 );
 	}
 }

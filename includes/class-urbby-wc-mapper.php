@@ -47,6 +47,29 @@ final class Urbby_WC_Mapper {
 	}
 
 	/**
+	 * ¿El pedido se cobra contra entrega? Un pedido sin `paymentMethod` o con otro valor (tarjeta,
+	 * ya cobrada en Urbby) no lo es: así el default es el comportamiento normal de Woo.
+	 *
+	 * @param array $fulfillment El pedido.
+	 * @return bool
+	 */
+	public static function is_cod( array $fulfillment ) {
+		return isset( $fulfillment['paymentMethod'] ) && 'cod' === $fulfillment['paymentMethod'];
+	}
+
+	/**
+	 * El estado de Woo en el que una orden cuenta como «pagada» (el que fija `date_paid`). Woo usa
+	 * `processing`, pero el contra entrega se cobra al entregar: ahí es `completed`. El resto, sin tocar.
+	 *
+	 * @param bool   $cod     Si la orden es contra entrega.
+	 * @param string $proposed El estado que propone Woo.
+	 * @return string
+	 */
+	public static function paid_status( $cod, $proposed ) {
+		return $cod ? 'completed' : $proposed;
+	}
+
+	/**
 	 * Llave de orden de los avisos: el más nuevo entre el pedido y su envío. Un aviso con una llave
 	 * menor o igual a la guardada es viejo (llegó tarde por un reintento) y no se aplica.
 	 *
@@ -147,21 +170,6 @@ final class Urbby_WC_Mapper {
 	}
 
 	/**
-	 * «Ana María López» → [ 'Ana María', 'López' ]. Urbby guarda un solo nombre.
-	 *
-	 * @param string $full Nombre completo.
-	 * @return array{0:string,1:string}
-	 */
-	public static function split_name( $full ) {
-		$parts = preg_split( '/\s+/', trim( (string) $full ) );
-		if ( count( $parts ) < 2 ) {
-			return array( (string) $parts[0], '' );
-		}
-		$last = array_pop( $parts );
-		return array( implode( ' ', $parts ), $last );
-	}
-
-	/**
 	 * Texto plano para Urbby: sin HTML ni espacios repetidos, cortado al máximo.
 	 *
 	 * @param string $html Texto de Woo.
@@ -188,5 +196,99 @@ final class Urbby_WC_Mapper {
 			$norm[] = function_exists( 'mb_strtolower' ) ? mb_strtolower( $v ) : strtolower( $v );
 		}
 		return implode( '|', $norm );
+	}
+
+	/**
+	 * Base64 apto para URL y para PKCE (RFC 7636): sin relleno, `-` y `_`.
+	 *
+	 * @param string $bytes Bytes crudos.
+	 * @return string
+	 */
+	public static function base64url( $bytes ) {
+		// phpcs:ignore WordPress.PHP.DiscouragedPHPFunctions.obfuscation_base64_encode -- PKCE (RFC 7636), no ofusca nada.
+		return rtrim( strtr( base64_encode( (string) $bytes ), '+/', '-_' ), '=' );
+	}
+
+	/**
+	 * Un `code_verifier` nuevo: 32 bytes al azar = 43 caracteres, lo que pide el contrato.
+	 *
+	 * @return string
+	 */
+	public static function new_verifier() {
+		return self::base64url( random_bytes( 32 ) );
+	}
+
+	/**
+	 * El `code_challenge` PKCE `S256` de un verifier: base64url(SHA-256(verifier)), 43 caracteres.
+	 *
+	 * @param string $verifier Verifier.
+	 * @return string
+	 */
+	public static function pkce_challenge( $verifier ) {
+		return self::base64url( hash( 'sha256', (string) $verifier, true ) );
+	}
+
+	/**
+	 * A dónde se manda a la persona a autorizar: la pantalla de consentimiento del portal.
+	 *
+	 * @param string $portal       Base del portal, sin barra final.
+	 * @param string $redirect_uri A donde vuelve con `code` y `state` (la pantalla del plugin).
+	 * @param string $state        Valor anti-CSRF atado a la sesión.
+	 * @param string $challenge    `code_challenge` S256.
+	 * @return string
+	 */
+	public static function authorize_url( $portal, $redirect_uri, $state, $challenge ) {
+		return rtrim( (string) $portal, '/' ) . '/integraciones/autorizar?' . http_build_query(
+			array(
+				'app'                   => 'woocommerce',
+				'redirect_uri'          => $redirect_uri,
+				'state'                 => $state,
+				'code_challenge'        => $challenge,
+				'code_challenge_method' => 'S256',
+			),
+			'',
+			'&',
+			PHP_QUERY_RFC3986
+		);
+	}
+
+	/**
+	 * Lo que Urbby va a rechazar de las direcciones de la conexión, para decirlo antes de mandar a la
+	 * persona al portal: `https` (en desarrollo también `http://localhost`) y el mismo host en la
+	 * pantalla de regreso y en el webhook.
+	 *
+	 * @param string $redirect_uri Pantalla del plugin a la que vuelve el portal.
+	 * @param string $webhook_url  Endpoint REST del plugin.
+	 * @return string '' si está bien; `https` o `host` si no.
+	 */
+	public static function connect_problem( $redirect_uri, $webhook_url ) {
+		// phpcs:disable WordPress.WP.AlternativeFunctions.parse_url_parse_url -- Clase pura, sin WordPress (se prueba sola).
+		$redirect = parse_url( (string) $redirect_uri );
+		$webhook  = parse_url( (string) $webhook_url );
+		// phpcs:enable
+		foreach ( array( $redirect, $webhook ) as $url ) {
+			if ( ! is_array( $url ) || empty( $url['host'] ) || ! empty( $url['user'] ) || ! empty( $url['pass'] ) ) {
+				return 'https';
+			}
+			$scheme = isset( $url['scheme'] ) ? strtolower( $url['scheme'] ) : '';
+			if ( 'https' !== $scheme && ! ( 'http' === $scheme && 'localhost' === strtolower( $url['host'] ) ) ) {
+				return 'https';
+			}
+		}
+		return strtolower( $redirect['host'] ) === strtolower( $webhook['host'] ) ? '' : 'host';
+	}
+
+	/**
+	 * Cómo sigue un intento de cancelar la orden en Urbby.
+	 *
+	 * @param Urbby_WC_Response $res Respuesta de `POST /public/orders/{id}/cancel`.
+	 * @return string `done` (cancelada, o ya lo estaba), `retry` (sin respuesta, error de Urbby o cambió
+	 *                mientras se cancelaba) o `restore` (Urbby no puede: la orden de Woo vuelve atrás).
+	 */
+	public static function cancel_outcome( Urbby_WC_Response $res ) {
+		if ( $res->ok() ) {
+			return 'done';
+		}
+		return $res->retryable() || 'FULFILLMENT_STATUS_CHANGED' === $res->code() ? 'retry' : 'restore';
 	}
 }

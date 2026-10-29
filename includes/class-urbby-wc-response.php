@@ -5,7 +5,7 @@
  * @package UrbbyWooCommerce
  */
 
-defined( 'ABSPATH' ) || exit;
+defined( 'ABSPATH' ) || defined( 'URBBY_WC_TESTS' ) || exit;
 
 /**
  * Respuesta de Urbby. `status` 0 = no hubo respuesta (red caída, timeout): eso NUNCA se lee como éxito.
@@ -50,8 +50,10 @@ final class Urbby_WC_Response {
 	/** @return string Un mensaje para mostrar. */
 	public function message() {
 		if ( 0 === $this->status ) {
-			return 'Urbby no respondió: ' . $this->network_error;
+			/* translators: %s: motivo técnico (timeout, red caída). */
+			return sprintf( __( 'Urbby no respondió: %s', 'urbby-woocommerce' ), $this->network_error );
 		}
-		return isset( $this->body['message'] ) ? (string) $this->body['message'] : 'Urbby respondió ' . $this->status . '.';
+		/* translators: %d: código HTTP. */
+		return isset( $this->body['message'] ) ? (string) $this->body['message'] : sprintf( __( 'Urbby respondió %d.', 'urbby-woocommerce' ), $this->status );
 	}
 }

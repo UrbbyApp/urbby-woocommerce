@@ -6,3 +6,4 @@
 define( 'URBBY_WC_TESTS', true );
 require dirname( __DIR__ ) . '/vendor/autoload.php';
 require dirname( __DIR__ ) . '/includes/class-urbby-wc-mapper.php';
+require dirname( __DIR__ ) . '/includes/class-urbby-wc-response.php';

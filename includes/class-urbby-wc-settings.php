@@ -17,6 +17,9 @@ final class Urbby_WC_Settings {
 	/** El API de Urbby. Otro (pruebas) solo con la constante `URBBY_WC_API_BASE` en `wp-config.php`. */
 	const PRODUCTION = 'https://api.urbby.app/v1';
 
+	/** El portal de comercios, donde se autoriza la conexión. Otro (pruebas) solo con `URBBY_WC_PORTAL_BASE` en `wp-config.php`. */
+	const PORTAL = 'https://comercios.urbby.app';
+
 	/**
 	 * Ajustes con sus valores por defecto.
 	 *
@@ -34,6 +37,12 @@ final class Urbby_WC_Settings {
 				'default_category' => '',
 				'category_map'     => array(),
 				'site'             => '',
+				// `connect` si la conexión salió de «Conectar con Urbby»; '' si se pegó a mano (v0.1.0).
+				'connection'       => '',
+				'webhook_id'       => '',
+				'store_name'       => '',
+				// Marca de que Urbby contestó 401: la credencial se revocó (p. ej. desde el portal).
+				'auth_failed'      => 0,
 			)
 		);
 	}
@@ -58,6 +67,34 @@ final class Urbby_WC_Settings {
 	}
 
 	/**
+	 * La URL base del portal de comercios, sin barra final. Como el API, solo se cambia desde `wp-config.php`:
+	 * es a donde se manda a la persona a autorizar.
+	 *
+	 * @return string
+	 */
+	public static function portal_base() {
+		return defined( 'URBBY_WC_PORTAL_BASE' ) ? untrailingslashit( (string) URBBY_WC_PORTAL_BASE ) : self::PORTAL;
+	}
+
+	/**
+	 * Olvida la credencial y el webhook de la conexión (los ajustes de categorías y reservas se quedan).
+	 */
+	public static function forget_connection() {
+		self::update(
+			array(
+				'client_id'      => '',
+				'client_secret'  => '',
+				'webhook_secret' => '',
+				'webhook_id'     => '',
+				'connection'     => '',
+				'store_name'     => '',
+				'site'           => '',
+				'auth_failed'    => 0,
+			)
+		);
+	}
+
+	/**
 	 * Este sitio es otro que el que se conectó: una copia (staging clonado, backup restaurado en otra
 	 * dirección) que heredó la credencial. Mientras no se vuelva a guardar la conexión, no habla con
 	 * Urbby: si no, vendería y movería el stock real desde la copia.
@@ -70,13 +107,26 @@ final class Urbby_WC_Settings {
 	}
 
 	/**
-	 * Hay credencial y es este sitio.
+	 * Hay credencial, es este sitio y Urbby no la rechazó (401).
 	 *
 	 * @return bool
 	 */
 	public static function connected() {
 		$s = self::get();
-		return '' !== $s['client_id'] && '' !== $s['client_secret'] && ! self::moved();
+		return '' !== $s['client_id'] && '' !== $s['client_secret'] && ! self::moved() && ! $s['auth_failed'];
+	}
+
+	/**
+	 * Las ventas de la tienda pasan por el stock de Urbby. Sin credencial, o con una que Urbby revocó (se
+	 * desconectó desde el portal), la tienda vende con su propio stock: si no, cada checkout de un
+	 * producto vinculado fallaría. A diferencia de `connected()`, una copia del sitio (`moved`) sigue
+	 * pasando por Urbby y falla: no vende con el stock de otro.
+	 *
+	 * @return bool
+	 */
+	public static function sells_via_urbby() {
+		$s = self::get();
+		return '' !== $s['client_id'] && ! $s['auth_failed'];
 	}
 
 	/**
